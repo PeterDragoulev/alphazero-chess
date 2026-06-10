@@ -1,0 +1,5 @@
+chess>=1.10
+numpy
+torch>=2.0
+datasets>=2.14
+huggingface_hub
