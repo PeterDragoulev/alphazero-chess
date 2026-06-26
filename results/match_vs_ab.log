@@ -1,0 +1,9 @@
+Loaded data/checkpoint.pt (1,780,611 games trained)
+Neural net (data/checkpoint.pt, loaded=True) vs alpha-beta d4, 5 games, NN 200 sims/move
+game 1/5 (NN=W): NN win   running +1 =0 -0  [93s]
+game 2/5 (NN=B): NN win   running +2 =0 -0  [193s]
+game 3/5 (NN=W): NN win   running +3 =0 -0  [296s]
+game 4/5 (NN=B): NN win   running +4 =0 -0  [398s]
+game 5/5 (NN=W): NN win   running +5 =0 -0  [493s]
+
+RESULT  neural net vs alpha-beta d4:  +5 =0 -0  score 1.00  Elo +382
