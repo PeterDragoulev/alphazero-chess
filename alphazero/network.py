@@ -8,7 +8,7 @@ import torch
 import torch.nn as nn
 
 from config import CFG
-from encoding import planes_to_float
+from encoding import HALFMOVE_PLANE, planes_to_float
 
 
 class ResBlock(nn.Module):
@@ -68,16 +68,40 @@ class PolicyValueNet(nn.Module):
 
 
 class Evaluator:
-    """Batched inference wrapper: uint8 planes in, numpy (logits, values) out."""
+    """
+    Batched inference wrapper: uint8 planes in, numpy (logits, values) out.
 
-    def __init__(self, model: PolicyValueNet, device: torch.device):
+    On CUDA every call replays a captured CUDA graph. At MCTS batch sizes the
+    GPU work is tiny and per-kernel launch overhead dominates (~5.6 ms per
+    call at batch 1 on the 3070 Ti under WSL2, ~0.8 ms as a graph replay).
+    Batches are padded up to a power-of-two bucket with one graph per bucket,
+    captured lazily. The graph reads the model's parameter and BatchNorm
+    buffers in place, so it keeps up with training (optimizer updates are
+    in-place) and always runs in eval mode, whatever model.training says.
+    """
+
+    MAX_GRAPH_BATCH = 1024
+
+    def __init__(self, model: PolicyValueNet, device: torch.device,
+                 use_graphs: bool = True):
         self.model = model
         self.device = device
         self.use_amp = device.type == "cuda"
+        self.use_graphs = use_graphs and device.type == "cuda"
+        self._graphs = {}            # bucket -> (graph, in_u8, logits, values)
+        self._pool = None
 
     @torch.inference_mode()
     def __call__(self, planes_u8: np.ndarray):
         """planes_u8: (B, 19, 8, 8) uint8 → (logits (B,4672), values (B,)) f32."""
+        b = len(planes_u8)
+        if self.use_graphs and b <= self.MAX_GRAPH_BATCH:
+            graph, x_in, logits, values = self._graph(1 << (b - 1).bit_length())
+            x_in[:b].copy_(torch.from_numpy(planes_u8))
+            graph.replay()
+            return (logits[:b].float().cpu().numpy(),
+                    values[:b].float().cpu().numpy())
+
         x = torch.from_numpy(planes_to_float(planes_u8)).to(self.device)
         was_training = self.model.training
         self.model.eval()
@@ -86,6 +110,37 @@ class Evaluator:
         if was_training:
             self.model.train()
         return logits.float().cpu().numpy(), values.float().cpu().numpy()
+
+    def _forward(self, x_u8: torch.Tensor):
+        x = x_u8.float()
+        x[:, HALFMOVE_PLANE] /= 100.0
+        # cache_enabled=False: re-cast the fp32 weights on every replay, so
+        # the graph sees weight updates instead of a stale fp16 copy.
+        with torch.autocast("cuda", dtype=torch.float16, cache_enabled=False):
+            return self.model(x)
+
+    def _graph(self, bucket: int):
+        if bucket in self._graphs:
+            return self._graphs[bucket]
+        was_training = self.model.training
+        self.model.eval()
+        x_in = torch.zeros((bucket, CFG.input_planes, 8, 8),
+                           dtype=torch.uint8, device=self.device)
+        side = torch.cuda.Stream()               # warm up off the main stream
+        side.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(side):
+            for _ in range(3):
+                self._forward(x_in)
+        torch.cuda.current_stream().wait_stream(side)
+        if self._pool is None:
+            self._pool = torch.cuda.graph_pool_handle()
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph, pool=self._pool):
+            logits, values = self._forward(x_in)
+        if was_training:
+            self.model.train()
+        self._graphs[bucket] = (graph, x_in, logits, values)
+        return self._graphs[bucket]
 
 
 def load_checkpoint(path: str, device: torch.device) -> tuple[PolicyValueNet, dict]:
