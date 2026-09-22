@@ -16,13 +16,8 @@ Conventions:
   - Node statistics live on edges (numpy arrays per node, vectorized PUCT).
   - The network value is from the perspective of the side to move at a node;
     it is negated at every step while backing up.
-  - The tree owns a private search board (a stack-less copy of the live
-    board, kept in sync by advance()). Simulations push moves on the way down
-    and pop them after the leaf is handled, instead of copying the board per
-    simulation; legal moves are generated once per leaf and reused for both
-    terminal detection and expansion.
   - Terminal detection inside the search ignores threefold repetition (the
-    game's move stack isn't copied). The *game* loop still ends games by
+    move stack isn't copied, for speed). The *game* loop still ends games by
     repetition via board.outcome(claim_draw=True).
 """
 
@@ -36,7 +31,7 @@ from encoding import encode_board, move_to_index
 
 
 class Node:
-    __slots__ = ("moves", "P", "N", "W", "children", "terminal")
+    __slots__ = ("moves", "P", "N", "W", "children")
 
     def __init__(self):
         self.moves = None        # list[chess.Move] once expanded
@@ -44,14 +39,14 @@ class Node:
         self.N = None            # visit counts    (k,) i32
         self.W = None            # total value     (k,) f32
         self.children = None     # list[Node|None]
-        self.terminal = None     # cached value if the position is game-over
 
 
-def _terminal_value(board: chess.Board, moves: list) -> float | None:
-    """Value for the side to move given its legal moves, or None if not over."""
-    if not moves:
-        return -1.0 if board.is_check() else 0.0
-    if board.is_insufficient_material() or board.halfmove_clock >= 100:
+def _terminal_value(board: chess.Board) -> float | None:
+    """Value from the perspective of the side to move, or None if not over."""
+    if board.is_checkmate():
+        return -1.0
+    if (board.is_stalemate() or board.is_insufficient_material()
+            or board.halfmove_clock >= 100):
         return 0.0
     return None
 
@@ -60,12 +55,11 @@ class MCTS:
     def __init__(self, board: chess.Board, add_noise: bool = False,
                  c_puct: float = CFG.c_puct):
         self.board = board                  # the live game board (shared)
-        self._search = board.copy(stack=False)  # private push/pop search board
         self.root = Node()
         self.add_noise = add_noise
         self.c_puct = c_puct
         self._noise_pending = add_noise
-        self._pending = None                # (node, path, moves) awaiting eval
+        self._pending = None                # (node, path, leaf_board) awaiting eval
 
     # -- one simulation, phase 1: descend ---------------------------------
 
@@ -76,11 +70,19 @@ class MCTS:
         call expand_backup() with the network output before the next select.
         """
         assert self._pending is None, "expand_backup() not called after select_leaf()"
-        board = self._search
+        board = self.board.copy(stack=False)
         node = self.root
         path = []
 
-        while node.moves is not None:
+        while True:
+            term = _terminal_value(board)
+            if term is not None:
+                self._backup(path, term)
+                return None
+            if node.moves is None:
+                self._pending = (node, path, board)
+                return encode_board(board)
+
             idx = self._puct_select(node)
             path.append((node, idx))
             board.push(node.moves[idx])
@@ -90,28 +92,14 @@ class MCTS:
                 node.children[idx] = child
             node = child
 
-        # Expanded nodes are never terminal, so only leaves need checking.
-        term = node.terminal
-        if term is None:
-            moves = list(board.legal_moves)
-            term = _terminal_value(board, moves)
-            node.terminal = term
-        if term is not None:
-            self._unwind(len(path))
-            self._backup(path, term)
-            return None
-        self._pending = (node, path, moves)
-        return encode_board(board)
-
     # -- one simulation, phase 2: expand + back up -------------------------
 
     def expand_backup(self, policy_logits: np.ndarray, value: float) -> None:
-        node, path, moves = self._pending
+        node, path, board = self._pending
         self._pending = None
 
-        turn = self._search.turn
-        self._unwind(len(path))
-        idxs = [move_to_index(m, turn) for m in moves]
+        moves = list(board.legal_moves)
+        idxs = [move_to_index(m, board.turn) for m in moves]
         logits = policy_logits[idxs]
         logits -= logits.max()
         priors = np.exp(logits)
@@ -133,11 +121,6 @@ class MCTS:
         q = node.W / np.maximum(node.N, 1)
         u = self.c_puct * node.P * (math.sqrt(node.N.sum() + 1) / (1 + node.N))
         return int(np.argmax(q + u))
-
-    def _unwind(self, plies: int) -> None:
-        """Pop the search board back to the root position."""
-        for _ in range(plies):
-            self._search.pop()
 
     @staticmethod
     def _backup(path, leaf_value: float) -> None:
@@ -174,7 +157,6 @@ class MCTS:
             new_root = self.root.children[self.root.moves.index(move)]
         self.root = new_root if new_root is not None else Node()
         self.board.push(move)
-        self._search.push(move)
         if self.add_noise:
             if self.root.moves is not None:
                 self._apply_noise()
