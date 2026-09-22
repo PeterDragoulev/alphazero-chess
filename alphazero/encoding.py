@@ -31,30 +31,33 @@ PLANES = 19
 POLICY_SIZE = 73 * 64
 HALFMOVE_PLANE = 17
 
-_PIECE_IDX = {chess.PAWN: 0, chess.KNIGHT: 1, chess.BISHOP: 2,
-              chess.ROOK: 3, chess.QUEEN: 4, chess.KING: 5}
-
 _QUEEN_DIR_IDX = {(0, 1): 0, (1, 1): 1, (1, 0): 2, (1, -1): 3,
                   (0, -1): 4, (-1, -1): 5, (-1, 0): 6, (-1, 1): 7}
 _KNIGHT_IDX = {(1, 2): 0, (2, 1): 1, (2, -1): 2, (1, -2): 3,
                (-1, -2): 4, (-2, -1): 5, (-2, 1): 6, (-1, 2): 7}
 _UNDERPROMO_IDX = {chess.KNIGHT: 0, chess.BISHOP: 1, chess.ROOK: 2}
+_PIECE_TYPES = (chess.PAWN, chess.KNIGHT, chess.BISHOP,
+                chess.ROOK, chess.QUEEN, chess.KING)
 
 
 def encode_board(board: chess.Board) -> np.ndarray:
     """Return (19, 8, 8) uint8 planes from the side-to-move's perspective."""
     planes = np.zeros((PLANES, 8, 8), dtype=np.uint8)
     us = board.turn
+    them = not us
     flip = us == chess.BLACK
 
-    for sq, piece in board.piece_map().items():
-        if flip:
-            sq = chess.square_mirror(sq)
-        rank, file = divmod(sq, 8)
-        base = 0 if piece.color == us else 6
-        planes[base + _PIECE_IDX[piece.piece_type], rank, file] = 1
+    # Piece planes straight from the 12 bitboards: bit i of a bitboard is
+    # square i = rank*8 + file, so little-endian unpacking lands each bit at
+    # [rank, file]. Mirroring for Black is a byte swap (chess.flip_vertical).
+    masks = [board.pieces_mask(pt, color)
+             for color in (us, them) for pt in _PIECE_TYPES]
+    if flip:
+        masks = [chess.flip_vertical(m) for m in masks]
+    raw = b"".join(m.to_bytes(8, "little") for m in masks)
+    planes[:12] = np.unpackbits(np.frombuffer(raw, dtype=np.uint8),
+                                bitorder="little").reshape(12, 8, 8)
 
-    them = not us
     if board.has_kingside_castling_rights(us):
         planes[12] = 1
     if board.has_queenside_castling_rights(us):
