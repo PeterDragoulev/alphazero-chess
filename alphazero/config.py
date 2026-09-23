@@ -18,6 +18,7 @@ class Config:
 
     # --- MCTS ---
     c_puct: float = 1.5
+    fpu_reduction: float = 0.25         # unvisited move Q = parent Q - this*sqrt(explored prior)
     dirichlet_alpha: float = 0.3
     dirichlet_eps: float = 0.25
 
@@ -39,14 +40,15 @@ class Config:
     games_per_block: int = 32           # checkpoint after this many finished games
 
     # --- play (engine.py / evaluate.py) ---
-    play_simulations: int = 400
+    play_simulations: int = 6400          # new sims per move (batched, tree reused: ~5 s)
+    play_batch: int = 16                # leaves per GPU call when playing (virtual loss)
 
     # --- paths ---
     data_dir: str = "data"
     checkpoint: str = "data/checkpoint.pt"
     pretrained_weights: str = "weights/pretrained_128x10.pt"   # shipped net
     buffer_dir: str = "data/buffer"
-    book_path: str = "baron30.bin"
+    book_path: str = "books/komodo.bin"  # polyglot; optional (engine skips if absent)
 
 
 CFG = Config()

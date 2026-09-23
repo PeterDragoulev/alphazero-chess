@@ -2,8 +2,8 @@
 engine.py — play interface: opening book → MCTS with the trained net.
 
 Exposes choose_move(board), MODEL_PATH and _model (ui.py and match_vs_ab.py
-import them). Loads data/checkpoint.pt if you've trained one, otherwise the
-shipped pretrained weights; with neither, falls back to a shallow material
+import them). Loads $CHESS_MODEL if set, else data/checkpoint.pt if you've trained one,
+else the shipped pretrained weights; with neither, falls back to a shallow material
 alpha-beta so the UI stays playable.
 """
 
@@ -14,14 +14,17 @@ import urllib.request
 
 import chess
 import chess.polyglot
+import numpy as np
 import torch
 
 from config import CFG
 from mcts import MCTS
 from network import Evaluator, load_checkpoint
 
-MODEL_PATH = (CFG.checkpoint if os.path.exists(CFG.checkpoint)
-              else CFG.pretrained_weights)
+# CHESS_MODEL=path/to.pt picks a specific checkpoint (e.g. to compare nets);
+# otherwise your trained checkpoint, else the shipped pretrained weights.
+MODEL_PATH = os.environ.get("CHESS_MODEL") or (
+    CFG.checkpoint if os.path.exists(CFG.checkpoint) else CFG.pretrained_weights)
 
 # Online endgame tablebase (Lichess, up to 7 pieces). No local storage — probed
 # over HTTP only when the board is already simple, so it adds no startup cost
@@ -46,14 +49,19 @@ else:
 
 
 def book_move(board: chess.Board) -> chess.Move | None:
+    """A book move, chosen by weight among the strong candidates (weight at
+    least half the best) so repeated games don't replay one opening."""
     try:
         with chess.polyglot.open_reader(CFG.book_path) as reader:
-            entry = reader.get(board)
-            if entry:
-                return entry.move
+            entries = list(reader.find_all(board))
     except FileNotFoundError:
-        pass
-    return None
+        return None
+    if not entries:
+        return None
+    top = max(e.weight for e in entries)
+    strong = [e for e in entries if e.weight * 2 >= top]
+    weights = np.array([e.weight for e in strong], dtype=np.float64)
+    return strong[np.random.choice(len(strong), p=weights / weights.sum())].move
 
 
 def tablebase_move(board: chess.Board) -> chess.Move | None:
@@ -112,13 +120,39 @@ def choose_move(board: chess.Board,
 
     sims = (simulations if simulations is not None
             else _phase_simulations(board, CFG.play_simulations))
-    mcts = MCTS(board, add_noise=False)
-    for _ in range(sims):
-        planes = mcts.select_leaf()
-        if planes is not None:
-            logits, values = _evaluator(planes[None])
-            mcts.expand_backup(logits[0], float(values[0]))
-    return mcts.best_move(temperature=0.0)
+    tree = _tree_for(board)
+    reused = int(tree.root.N.sum()) if tree.root.N is not None else 0
+    done = 0
+    while done < sims:
+        planes, n = tree.select_leaves(min(CFG.play_batch, sims - done))
+        done += n
+        if planes:
+            logits, values = _evaluator(np.stack(planes))
+            tree.expand_leaves(logits, values)
+    last_search.update(sims=done, reused=reused, **tree.depth_stats())
+    return tree.best_move(temperature=0.0)
+
+
+# Search tree kept between moves: when the next call continues the same game
+# (our move + the opponent's reply), the matching subtree is reused instead of
+# thrown away. Any other position (new game, takeback, setup) starts fresh.
+_tree: MCTS | None = None
+last_search: dict = {}          # stats of the most recent search (for the UI)
+
+
+def _tree_for(board: chess.Board) -> MCTS:
+    global _tree
+    t = _tree
+    if t is not None:
+        played, stack = t.board.move_stack, board.move_stack
+        if (len(played) <= len(stack) <= len(played) + 4
+                and stack[:len(played)] == played):
+            for move in stack[len(played):]:
+                t.advance(move)
+            if t.board.fen() == board.fen():
+                return t
+    _tree = MCTS(board.copy(), add_noise=False)   # never mutate the caller's board
+    return _tree
 
 
 # -- fallback: material alpha-beta (pre-training only) --------------------------

@@ -12,6 +12,16 @@ This lets self-play run N games in lockstep and evaluate all their leaves in
 a single GPU call, which is where all the throughput on a single GPU comes
 from.
 
+A single game (engine.py, playing a human) batches *within* one tree instead:
+
+    planes, n = mcts.select_leaves(k)    # up to k distinct leaves (virtual loss)
+    mcts.expand_leaves(logits, values)   # answer them in the same order
+
+Each descent adds a virtual loss to the edges it walks (as if that line had
+just lost), steering the next descent in the same batch onto a different line.
+Virtual losses live in a separate integer array (Node.VL), so reverting them
+is exact and N/W only ever hold real results.
+
 Conventions:
   - Node statistics live on edges (numpy arrays per node, vectorized PUCT).
   - The network value is from the perspective of the side to move at a node;
@@ -21,9 +31,11 @@ Conventions:
     and pop them after the leaf is handled, instead of copying the board per
     simulation; legal moves are generated once per leaf and reused for both
     terminal detection and expansion.
-  - Terminal detection inside the search ignores threefold repetition (the
-    game's move stack isn't copied). The *game* loop still ends games by
-    repetition via board.outcome(claim_draw=True).
+  - Repetitions: a leaf whose position already occurred in the game or
+    earlier on the current search line is scored as a draw (the usual
+    in-search twofold rule), so the engine steers into repetitions when
+    worse and avoids them when better. The game loop still ends games by
+    threefold via board.outcome(claim_draw=True).
 """
 
 import math
@@ -36,7 +48,8 @@ from encoding import encode_board, move_to_index
 
 
 class Node:
-    __slots__ = ("moves", "P", "N", "W", "children", "terminal")
+    __slots__ = ("moves", "P", "N", "W", "children", "terminal", "in_flight",
+                 "VL")
 
     def __init__(self):
         self.moves = None        # list[chess.Move] once expanded
@@ -45,6 +58,8 @@ class Node:
         self.W = None            # total value     (k,) f32
         self.children = None     # list[Node|None]
         self.terminal = None     # cached value if the position is game-over
+        self.in_flight = False   # selected in the current batch, awaiting eval
+        self.VL = None           # virtual losses in flight per edge (k,) i32
 
 
 def _terminal_value(board: chess.Board, moves: list) -> float | None:
@@ -56,16 +71,38 @@ def _terminal_value(board: chess.Board, moves: list) -> float | None:
     return None
 
 
+def _position_keys(board: chess.Board) -> set:
+    """Repetition keys of every position in the board's game history."""
+    b = board.copy()
+    keys = {b._transposition_key()}
+    while b.move_stack:
+        b.pop()
+        keys.add(b._transposition_key())
+    return keys
+
+
+_COLLISION = object()     # _descend(): leaf already awaiting evaluation
+
+
 class MCTS:
     def __init__(self, board: chess.Board, add_noise: bool = False,
-                 c_puct: float = CFG.c_puct):
+                 c_puct: float = CFG.c_puct,
+                 fpu_reduction: float | None = CFG.fpu_reduction,
+                 repetition_draws: bool = True):
+        # fpu_reduction=None and repetition_draws=False give the original
+        # AlphaZero rules (unvisited Q = 0, repetitions ignored) — used by the
+        # benchmarks to compare against the pre-FPU baseline like for like.
         self.board = board                  # the live game board (shared)
         self._search = board.copy(stack=False)  # private push/pop search board
+        self._history = _position_keys(board)   # positions seen in the game
         self.root = Node()
         self.add_noise = add_noise
         self.c_puct = c_puct
+        self.fpu_reduction = fpu_reduction
+        self.repetition_draws = repetition_draws
         self._noise_pending = add_noise
-        self._pending = None                # (node, path, moves) awaiting eval
+        self._pending = None                # one leaf awaiting eval (select_leaf)
+        self._batch = []                    # leaves awaiting eval (select_leaves)
 
     # -- one simulation, phase 1: descend ---------------------------------
 
@@ -75,42 +112,108 @@ class MCTS:
         return None. Otherwise return its encoded planes; the caller must
         call expand_backup() with the network output before the next select.
         """
-        assert self._pending is None, "expand_backup() not called after select_leaf()"
+        assert self._pending is None and not self._batch, \
+            "expand_backup()/expand_leaves() not called after select"
+        leaf = self._descend(virtual_loss=False)
+        if leaf is None:
+            return None
+        self._pending = leaf
+        return leaf[4]
+
+    # -- one simulation, phase 2: expand + back up -------------------------
+
+    def expand_backup(self, policy_logits: np.ndarray, value: float) -> None:
+        leaf, self._pending = self._pending, None
+        self._expand(leaf, policy_logits, value, virtual_loss=False)
+
+    # -- batched simulations within one tree (virtual loss) --------------------
+
+    def select_leaves(self, k: int) -> tuple[list[np.ndarray], int]:
+        """
+        Run up to k simulations' descents. Returns (planes of the distinct
+        leaves to evaluate, simulations used). Terminal leaves are backed up
+        immediately and count as simulations; the batch stops early if a
+        descent collides with a leaf already selected in it. Answer with
+        expand_leaves() before selecting again.
+        """
+        assert self._pending is None and not self._batch, \
+            "expand_backup()/expand_leaves() not called after select"
+        planes, sims = [], 0
+        for _ in range(k):
+            leaf = self._descend(virtual_loss=True)
+            if leaf is _COLLISION:
+                break
+            sims += 1
+            if leaf is not None:
+                self._batch.append(leaf)
+                planes.append(leaf[4])
+        return planes, sims
+
+    def expand_leaves(self, policy_logits: np.ndarray, values: np.ndarray) -> None:
+        batch, self._batch = self._batch, []
+        for i, leaf in enumerate(batch):
+            self._expand(leaf, policy_logits[i], float(values[i]), virtual_loss=True)
+
+    def _descend(self, virtual_loss: bool):
+        """
+        Select down to a leaf on the push/pop search board, then pop back to
+        the root. Returns (node, path, moves, turn, planes) for a leaf that
+        needs the network, None for a terminal (already backed up), or
+        _COLLISION if the leaf is already awaiting evaluation.
+        """
         board = self._search
         node = self.root
         path = []
+        line = [board._transposition_key()]     # positions on this search line
 
         while node.moves is not None:
             idx = self._puct_select(node)
             path.append((node, idx))
+            if virtual_loss:
+                if node.VL is None:
+                    node.VL = np.zeros(len(node.moves), dtype=np.int32)
+                node.VL[idx] += 1
             board.push(node.moves[idx])
+            line.append(board._transposition_key())
             child = node.children[idx]
             if child is None:
                 child = Node()
                 node.children[idx] = child
             node = child
 
+        if node.in_flight:
+            self._unwind(len(path))
+            self._revert_virtual_loss(path)
+            return _COLLISION
+
         # Expanded nodes are never terminal, so only leaves need checking.
         term = node.terminal
         if term is None:
-            moves = list(board.legal_moves)
-            term = _terminal_value(board, moves)
+            key = line[-1]
+            if path and self.repetition_draws and (
+                    key in self._history or key in line[:-1]):
+                term = 0.0                   # repetition: scored as a draw
+            else:
+                moves = list(board.legal_moves)
+                term = _terminal_value(board, moves)
             node.terminal = term
         if term is not None:
             self._unwind(len(path))
+            if virtual_loss:
+                self._revert_virtual_loss(path)
             self._backup(path, term)
             return None
-        self._pending = (node, path, moves)
-        return encode_board(board)
 
-    # -- one simulation, phase 2: expand + back up -------------------------
-
-    def expand_backup(self, policy_logits: np.ndarray, value: float) -> None:
-        node, path, moves = self._pending
-        self._pending = None
-
-        turn = self._search.turn
+        leaf = (node, path, moves, board.turn, encode_board(board))
         self._unwind(len(path))
+        node.in_flight = virtual_loss
+        return leaf
+
+    def _expand(self, leaf, policy_logits, value: float, virtual_loss: bool) -> None:
+        node, path, moves, turn, _ = leaf
+        if virtual_loss:
+            self._revert_virtual_loss(path)
+            node.in_flight = False
         idxs = [move_to_index(m, turn) for m in moves]
         logits = policy_logits[idxs]
         logits -= logits.max()
@@ -130,14 +233,35 @@ class MCTS:
     # -- internals ----------------------------------------------------------
 
     def _puct_select(self, node: Node) -> int:
-        q = node.W / np.maximum(node.N, 1)
-        u = self.c_puct * node.P * (math.sqrt(node.N.sum() + 1) / (1 + node.N))
+        N, W = node.N, node.W
+        if node.VL is not None:          # in-flight visits count as losses
+            N = N + node.VL
+            W = W - node.VL
+        n_total = N.sum()
+        if n_total and self.fpu_reduction is not None:
+            # First-play urgency (Lc0-style): score unvisited moves a bit below
+            # this node's current average instead of at 0 (a "draw"), so a
+            # losing position doesn't spray visits over every untried move and
+            # a winning one still explores. The penalty grows with the share of
+            # prior already explored.
+            visited = N > 0
+            fpu = (W.sum() / n_total
+                   - self.fpu_reduction * math.sqrt(node.P[visited].sum()))
+            q = np.where(visited, W / np.maximum(N, 1), fpu)
+        else:                                # unvisited moves count as Q = 0
+            q = W / np.maximum(N, 1)
+        u = self.c_puct * node.P * (math.sqrt(n_total + 1) / (1 + N))
         return int(np.argmax(q + u))
 
     def _unwind(self, plies: int) -> None:
         """Pop the search board back to the root position."""
         for _ in range(plies):
             self._search.pop()
+
+    @staticmethod
+    def _revert_virtual_loss(path) -> None:
+        for node, idx in path:
+            node.VL[idx] -= 1
 
     @staticmethod
     def _backup(path, leaf_value: float) -> None:
@@ -167,6 +291,34 @@ class MCTS:
         probs /= probs.sum()
         return self.root.moves[int(np.random.choice(len(probs), p=probs))]
 
+    def depth_stats(self) -> dict:
+        """
+        How deep the tree reaches: `depth` = length of the principal variation
+        (most-visited child at each step, following nodes with >= 1 visit),
+        `seldepth` = deepest expanded node, `mean_depth` = visit-weighted mean
+        depth of expanded nodes.
+        """
+        depth, node = 0, self.root
+        while node.moves is not None and node.N.sum() > 0:
+            idx = int(np.argmax(node.N))
+            child = node.children[idx]
+            if child is None or child.moves is None:
+                break
+            depth, node = depth + 1, child
+        seldepth, total, weighted = 0, 0, 0
+        stack = [(self.root, 0)]
+        while stack:
+            node, d = stack.pop()
+            if node.moves is None:
+                continue
+            seldepth = max(seldepth, d)
+            n = int(node.N.sum())
+            total += n
+            weighted += n * d
+            stack.extend((c, d + 1) for c in node.children if c is not None)
+        return {"depth": depth, "seldepth": seldepth,
+                "mean_depth": weighted / total if total else 0.0}
+
     def advance(self, move: chess.Move) -> None:
         """Play a move on the live board, reusing the subtree if we have it."""
         new_root = None
@@ -175,6 +327,7 @@ class MCTS:
         self.root = new_root if new_root is not None else Node()
         self.board.push(move)
         self._search.push(move)
+        self._history.add(self._search._transposition_key())
         if self.add_noise:
             if self.root.moves is not None:
                 self._apply_noise()

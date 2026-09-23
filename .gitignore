@@ -8,3 +8,6 @@ alphazero/data/
 
 # optional polyglot opening book
 baron30.bin
+
+# downloaded polyglot opening book (see README)
+alphazero/books/
