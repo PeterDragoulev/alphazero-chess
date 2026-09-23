@@ -325,6 +325,11 @@ class MCTS:
         if self.root.moves is not None and move in self.root.moves:
             new_root = self.root.children[self.root.moves.index(move)]
         self.root = new_root if new_root is not None else Node()
+        # A leaf the search scored as a repetition draw can become the real
+        # position (the game repeated once). At the root that isn't game over —
+        # we still need a move — so drop the cached verdict and expand it.
+        if self.root.moves is None:
+            self.root.terminal = None
         self.board.push(move)
         self._search.push(move)
         self._history.add(self._search._transposition_key())
