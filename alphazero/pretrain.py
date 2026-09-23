@@ -172,9 +172,12 @@ def game_records(game):
 
 # pyarrow/datasets streaming leaks ~1 GB/hour per process, so each worker is
 # a small supervisor that runs the stream in a fresh child ("generation") and
-# replaces it every WORKER_GENERATION_GAMES games (~13 min) — the leaked
-# memory goes with the child.
+# replaces it every WORKER_GENERATION_GAMES games or WORKER_GENERATION_SECONDS,
+# whichever comes first — the leaked memory goes with the child. The time cap
+# matters for strict filters: the leak tracks rows *read*, and at --min-elo
+# 2400 a worker reads ~5x more rows per accepted game than at 2200.
 WORKER_GENERATION_GAMES = 30_000
+WORKER_GENERATION_SECONDS = 15 * 60
 
 
 class _StreamStop:
@@ -198,6 +201,7 @@ class _StreamStop:
 def _ingest_generation(out, min_elo, seed, part, nparts, main_pid):
     stop = _StreamStop(main_pid)
     sent = 0
+    deadline = time.time() + WORKER_GENERATION_SECONDS
     try:
         for movetext, z in stream_games(min_elo, seed, stop, part, nparts):
             game = encode_game(movetext)
@@ -211,7 +215,7 @@ def _ingest_generation(out, min_elo, seed, part, nparts, main_pid):
                     if stop.requested:
                         return
             sent += 1
-            if sent >= WORKER_GENERATION_GAMES:
+            if sent >= WORKER_GENERATION_GAMES or time.time() > deadline:
                 break
         out.close()
         out.join_thread()                    # flush queued games before exiting
