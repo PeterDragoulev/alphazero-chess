@@ -19,6 +19,13 @@ trained entirely on one laptop GPU (RTX 3070 Ti, 8 GB VRAM).
   plus **~10–15%** from push/pop board traversal.
 - The pretrained network (1.78M strong Lichess games, ~8 GPU-hours) **beat a
   depth-4 alpha-beta searcher 5–0 and a depth-5 searcher 1–0**.
+- First-play urgency (FPU) in the search: **+102 Elo** (95% CI +66..+140) in a
+  200-game paired arena, same net and simulation budget.
+- Play-time search is **4x faster** per simulation (virtual-loss batching within
+  one tree, CUDA graphs, tree reuse), which in the same ~1.2 s per move takes
+  the principal variation from **~12 to ~17 plies**.
+- Pretraining ingestion went from ~4,300 to **~6,900 positions/s** with
+  parallel worker processes and a 1.9x faster board encoder.
 
 ---
 
@@ -156,6 +163,35 @@ generated once per leaf and reused for both terminal detection (no legal moves
 means checkmate or stalemate) and expansion. Previously they were generated up
 to three times per simulation (`is_checkmate`, `is_stalemate`, expansion).
 
+**First-play urgency (FPU).** Plain AlphaZero scores a move that hasn't been
+visited yet as Q = 0, i.e. "probably a draw". In a losing position every
+untried move then looks better than the tried ones, so the search sprays its
+visits across junk. Following Lc0, an unvisited move is instead scored at the
+parent's current average minus `0.25 · √(prior mass already explored)`. In a
+200-game paired arena (same net, 200 simulations, each opening played with
+both colors) this scored **+83 =91 −26, +102 Elo (95% CI +66..+140)** against
+the Q = 0 rule.
+
+**Batching within one tree (virtual loss).** Self-play batches across 64
+games, but a single game against a human only has one tree. `select_leaves(k)`
+descends k times; each descent adds a *virtual loss* to the edges it walks, as
+if that line had just lost, so the next descent picks a different line. The k
+leaves go to the GPU in one call, then `expand_leaves()` removes the virtual
+losses and backs up the real values. Virtual losses live in a separate integer
+array, so removing them is exact: a batch of 1 is bit-identical to the
+single-leaf search.
+
+**Tree reuse and repetitions.** When playing, the engine keeps its tree
+between moves and continues from the subtree under the moves actually played.
+A leaf that repeats a position from the game, or an earlier position on its
+own search line, is scored as a draw (the usual in-search twofold rule). In
+tests, the winning side stopped playing the repeating move (the old search
+scored it +0.88; the new one scores it 0.00), and the losing side took the
+repetition instead of playing on at −0.67.
+
+For benchmarking, `MCTS(..., fpu_reduction=None, repetition_draws=False)`
+switches both of these off and reproduces the original search exactly.
+
 ### Training pipeline
 
 **1. Supervised pretraining (`pretrain.py`).** Self-play starting from a
@@ -172,6 +208,22 @@ produces ~5,000. So the net is first trained on strong human games:
   shuffling the order of the ~26k monthly parquet shards and reading them
   sequentially, which stays under 1 GB. Each session uses a new seed, so
   resuming sees new games.
+- **Parallel ingestion:** PGN parsing and board encoding were the bottleneck,
+  so `--workers` processes (default 2) each stream a disjoint slice of the
+  shuffled shards, while the main process only fills the buffer and trains.
+  Throughput went from ~4,300 to ~6,900 positions/s; now the training step is
+  the limit. The workers are forked before CUDA starts.
+- **Leak containment:** the streaming stack (`datasets`/pyarrow) leaks about
+  1 GB per hour per process, and after two hours it nearly ran the machine out
+  of memory. Each worker is now a small supervisor that runs the stream in a
+  fresh child process and replaces it every 30k games (~13 minutes). The child
+  flushes its queue before exiting, so no games are lost. Replacing children
+  much more often trips HuggingFace's API rate limit (1,000 requests per 5
+  minutes), because each new child lists the dataset.
+- **Faster encoding:** `encode_board` builds the 12 piece planes from
+  python-chess bitboards in one numpy call instead of looping over pieces.
+  It's 1.9x faster (27 → 14 µs), and its output is byte-identical to the old
+  encoder on 38k positions.
 
 **2. Self-play fine-tuning (`train.py` + `selfplay.py`).** This is the AlphaZero
 loop:
@@ -198,10 +250,20 @@ phases just means running the other script.
 
 ### Playing (`engine.py`)
 
-The play path is: opening book (if `baron30.bin` is present) → Lichess 7-piece
-endgame tablebase (probed online, only when ≤ 7 pieces remain) → MCTS with
-400 simulations. The search budget is scaled up in endgames, where the tree is
-narrow and deep calculation decides the game.
+The play path is: opening book → Lichess 7-piece endgame tablebase (probed
+online, only when ≤ 7 pieces remain) → MCTS with 6,400 simulations per move
+(~5 s, batched 16 leaves per GPU call, tree reused between moves). The search
+budget is doubled or quadrupled in endgames, where the tree is narrow and deep
+calculation decides the game.
+
+- **Opening book:** optional; run `alphazero/download_book.sh` to fetch the
+  Komodo polyglot book (freely distributed, not stored in this repo). The
+  engine picks among the strong book moves (weight ≥ half the best),
+  weighted, so repeated games don't replay one opening.
+- **UI:** after each engine move the status bar shows the search depth,
+  seldepth, simulations run and visits reused. A pawn reaching the last rank
+  opens a promotion picker, and every clicked move is checked for legality
+  before it's played.
 
 ---
 
@@ -232,10 +294,36 @@ push/pop over batched+copy: +12%
 ```
 
 Across runs: batching gives 14–17x, push/pop adds 10–15%, and the total is
-16–18x. `benchmarks/check_equivalence.py` verifies that the push/pop tree
+16–18x (on an idle machine; measured while training was also running, the
+ratios came out a little higher). A fourth row adds CUDA graphs, which gain
+only a few percent at self-play batch sizes. `benchmarks/check_equivalence.py` verifies that the push/pop tree
 produces **exactly the same visit counts and values** as the copy-based
 baseline (`mcts_copy_baseline.py`), including checkmate, stalemate and
 50-move-rule positions. It is a pure speedup with no change in behavior.
+
+**Play-time search.** A game against one opponent has only one tree, so the
+batching above doesn't apply. Three changes speed up that case:
+
+- **CUDA graphs:** `Evaluator` captures one graph per power-of-two batch size
+  and replays it. At small batches the GPU work is tiny and kernel-launch
+  overhead dominates, so a batch-1 call drops from **~5.7 ms to ~1.0 ms**.
+  The graph reads the weights in place, so it stays correct while training
+  updates them.
+- **Virtual-loss batching:** 16 leaves per GPU call instead of 1.
+- **Tree reuse** between moves.
+
+Measured over 20 middlegame plies (depth = length of the principal variation;
+seldepth = deepest line searched):
+
+| Setting | Time/move | Depth | Seldepth |
+|---|---|---|---|
+| 1 leaf per call, 400 sims, fresh tree (before) | 1.07 s | 12.2 | 13.8 |
+| 16 leaves per call, 400 sims | 0.27 s | 9.9 | 11.5 |
+| 16 per call, 1,600 sims + tree reuse | 1.30 s | 16.8 | 20.6 |
+| 16 per call, 3,200 sims + tree reuse | 2.54 s | 17.6 | 21.4 |
+
+In a short check (10 paired-opening games, a small sample), the new settings
+at 1,600 simulations scored +7 =3 −0 against the old ones at 400.
 
 ---
 
@@ -282,7 +370,9 @@ pip install -r requirements.txt       # install a CUDA build of torch for GPU us
 python 1_search/search.py
 
 # Stage 3: play against the pretrained net (tkinter UI)
-cd alphazero && python ui.py
+cd alphazero && ./download_book.sh    # optional opening book
+python ui.py
+CHESS_MODEL=data/other.pt python ui.py   # play a specific checkpoint
 
 # Benchmarks (from the repo root)
 python benchmarks/check_equivalence.py
@@ -293,6 +383,7 @@ Training (run inside `alphazero/`; state lives in `alphazero/data/`):
 
 ```bash
 python pretrain.py --minutes 480            # supervised on Lichess games
+python pretrain.py --lr 3e-4                # override the learning rate saved in the checkpoint
 python train.py --minutes 480               # self-play fine-tuning
 python evaluate.py data/checkpoint.pt data/old.pt --games 40   # arena A vs B
 python match_vs_ab.py 10 4                  # net vs alpha-beta depth 4, 10 games
@@ -307,9 +398,12 @@ Set `HF_TOKEN` for higher HuggingFace rate limits on long pretraining runs.
 - Board operations run in Python (python-chess). A C++ move generator, or
   running self-play workers in several processes feeding one GPU batch, is
   the next big throughput lever.
-- `engine.py` and `evaluate.py` still evaluate one leaf at a time. Batching
-  arena games the way `selfplay.py` does would speed up evaluation a lot.
-- In-search terminal detection ignores threefold repetition. Games still end
-  correctly by repetition in the game loop.
+- `evaluate.py` still evaluates one leaf at a time. Batching arena games the
+  way `selfplay.py` does would speed up evaluation a lot.
+- The learning rate is lowered by hand when the loss plateaus (1e-3 → 3e-4 →
+  1e-4 so far). An automatic reduce-on-plateau schedule is the obvious next
+  step.
+- The network has no history planes, so it can't see repetitions itself;
+  only the search can.
 - The checkpoint records `{channels, blocks}`, so a larger network can be
   trained without breaking old checkpoints.
