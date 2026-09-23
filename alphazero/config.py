@@ -46,7 +46,7 @@ class Config:
     # --- paths ---
     data_dir: str = "data"
     checkpoint: str = "data/checkpoint.pt"
-    pretrained_weights: str = "weights/pretrained_128x10.pt"   # shipped net
+    pretrained_weights: str = "weights/lichess_5.66M_128x10.pt"   # shipped net (June net: pretrained_128x10.pt)
     buffer_dir: str = "data/buffer"
     book_path: str = "books/komodo.bin"  # polyglot; optional (engine skips if absent)
 

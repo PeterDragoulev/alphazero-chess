@@ -1,0 +1,13 @@
+data/checkpoint.pt (5,662,345 games) at 1600 sims  vs  Stockfish UCI_Elo 2700 at 3.0s/move
+game 10 (we Black): draw in 58 plies  [246s]
+game  9 (we White): win in 67 plies  [285s]
+game  1 (we White): win in 73 plies  [307s]
+game  2 (we Black): win in 108 plies  [426s]
+game  3 (we White): win in 115 plies  [445s]
+game  8 (we Black): draw in 122 plies  [466s]
+game  7 (we White): win in 135 plies  [502s]
+game  5 (we White): loss in 148 plies  [535s]
+game  4 (we Black): draw in 194 plies  [628s]
+game  6 (we Black): win in 226 plies  [683s]
+
+vs Stockfish 2700: +6 =3 -1  score 0.75  ->  estimated Elo ~2891 (+191)  [683s]

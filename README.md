@@ -4,6 +4,12 @@ A chess engine built up in stages, from classical game-tree search to an
 AlphaZero-style policy-value network guided by Monte-Carlo Tree Search, and
 trained entirely on one laptop GPU (RTX 3070 Ti, 8 GB VRAM).
 
+> **Strength: about 2,850–2,900 Elo against strength-limited Stockfish.**
+> At equal thinking time the engine plays Stockfish 19 set to `UCI_Elo 2900`
+> roughly even (+1 =7 −2) and beats it at 2700 (+6 =3 −1). This is on
+> Stockfish's computer-rating scale, not a FIDE or chess.com rating; see
+> [Strength vs Stockfish](#strength-vs-stockfish).
+
 | Stage | Folder | Idea |
 |---|---|---|
 | 1 | [`1_search/`](1_search) | Minimax, then alpha-beta pruning over a material evaluator |
@@ -13,6 +19,8 @@ trained entirely on one laptop GPU (RTX 3070 Ti, 8 GB VRAM).
 
 **Headline numbers** (all measured on this repo; see [Results](#results)):
 
+- **~2,850–2,900 Elo vs strength-limited Stockfish** (UCI_Elo scale), from 40
+  games at four levels.
 - Alpha-beta finds the same move scores as minimax while searching **7–52x fewer nodes**.
 - Self-play MCTS runs **~16–18x faster** than the naive implementation:
   ~14–17x from batching leaf evaluations across 64 games into single GPU calls,
@@ -355,8 +363,44 @@ the net toward its own weaker play. At this compute scale, self-play is the
 bottleneck. That is why the MCTS speed work matters, and why pretraining comes
 first.
 
-The shipped weights (`alphazero/weights/pretrained_128x10.pt`, fp16, 7 MB)
-are that pretrained network.
+**Continued pretraining** (September): 3.9M more games with both players
+rated 2200+, first at learning rate 3e-4 and then 1e-4, each drop made when
+the loss had plateaued. Policy loss fell from 1.444 to 1.361. Against the June
+net, in 10 distinct games (5 openings × both colors, 400 simulations each), the
+new net scored **+9 =1 −0**.
+
+### Strength vs Stockfish
+
+`alphazero/elo_stockfish.py` plays the engine against Stockfish 19 with
+`UCI_LimitStrength` on, which caps Stockfish at a chosen rating from 1320 to
+3190. Each match is 10 games: 5 openings sampled from the net's policy (all
+different), each played with both colors. The engine uses pure search (no
+opening book, no tablebase), all games run in parallel, and the implied
+rating is the Stockfish level plus the Elo difference implied by the score.
+
+| Stockfish level | Stockfish time | Engine | Result | Implied rating |
+|---|---|---|---|---|
+| 2000 | 1 s/move | 1,600 sims | +10 =0 −0 | > 2000 (sweep) |
+| 2400 | 1 s/move | 1,600 sims | +7 =3 −0 | ~2700 |
+| **2700** | **3 s/move** | **1,600 sims (~3 s)** | **+6 =3 −1** | **~2890** |
+| **2900** | **3 s/move** | **1,600 sims (~3 s)** | **+1 =7 −2** | **~2865** |
+
+The two equal-time matches agree to within 25 points, which puts the engine at
+**~2,850–2,900**. It plays Stockfish-2900 roughly even. Caveats:
+
+- `UCI_Elo` is calibrated against computer rating lists at longer time
+  controls, so this is an estimate on Stockfish's scale, not a human rating.
+- 10 games per level leaves wide error bars, roughly ±150–200 for a single
+  match.
+- Default play uses 6,400 simulations per move, which should be somewhat
+  stronger than the 1,600 tested here.
+
+Logs are in [`results/stockfish/`](results/stockfish).
+
+The shipped weights are this continued-pretraining net
+(`alphazero/weights/lichess_5.66M_128x10.pt`, fp16, 7 MB; 5.66M games). The
+June pretrained net is kept as `alphazero/weights/pretrained_128x10.pt`,
+because the older results above were measured with it.
 
 ---
 
@@ -377,6 +421,9 @@ CHESS_MODEL=data/other.pt python ui.py   # play a specific checkpoint
 # Benchmarks (from the repo root)
 python benchmarks/check_equivalence.py
 python benchmarks/bench_mcts.py
+
+# Rating against strength-limited Stockfish (needs a stockfish binary)
+cd alphazero && python elo_stockfish.py --elo 2700 --sf-time 3
 ```
 
 Training (run inside `alphazero/`; state lives in `alphazero/data/`):
@@ -401,7 +448,7 @@ Set `HF_TOKEN` for higher HuggingFace rate limits on long pretraining runs.
 - `evaluate.py` still evaluates one leaf at a time. Batching arena games the
   way `selfplay.py` does would speed up evaluation a lot.
 - The learning rate is lowered by hand when the loss plateaus (1e-3 → 3e-4 →
-  1e-4 so far). An automatic reduce-on-plateau schedule is the obvious next
+  1e-4 so far). Training on 2400+ games is next. An automatic reduce-on-plateau schedule is the obvious next
   step.
 - The network has no history planes, so it can't see repetitions itself;
   only the search can.
