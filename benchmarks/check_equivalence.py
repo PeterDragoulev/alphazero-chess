@@ -4,7 +4,9 @@ check_equivalence.py — push/pop MCTS searches exactly like the copy baseline.
 Runs both trees with the same seed and a small random-weight net (CPU, so it
 is deterministic) over several plies, and asserts the root visit counts and
 values match exactly — including positions with mates, stalemates, the
-50-move rule and insufficient material.
+50-move rule and insufficient material. The current tree runs with FPU and
+repetition draws switched off (fpu_reduction=None, repetition_draws=False):
+those change the search on purpose; this check isolates the push/pop rewrite.
 
     python check_equivalence.py
 """
@@ -30,6 +32,9 @@ FENS = {
 }
 
 
+CLASSIC = {"mcts_new": dict(fpu_reduction=None, repetition_draws=False)}
+
+
 def load(path, name):
     spec = importlib.util.spec_from_file_location(name, path)
     mod = importlib.util.module_from_spec(spec)
@@ -40,7 +45,7 @@ def load(path, name):
 def trace(mod, ev, fen, plies=6, sims=200):
     np.random.seed(1)
     board = chess.Board(fen)
-    tree = mod.MCTS(board, add_noise=True)
+    tree = mod.MCTS(board, add_noise=True, **CLASSIC.get(mod.__name__, {}))
     out = []
     for _ in range(plies):
         if board.outcome(claim_draw=True):

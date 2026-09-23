@@ -11,11 +11,18 @@ move, the pretrained net, Dirichlet noise at the root) three ways:
   3. batched   + push/pop  (current alphazero/mcts.py) search board is pushed
                          down the path and popped back, legal moves generated
                          once per leaf
+  4. + CUDA graphs       the same, with the evaluator replaying captured CUDA
+                         graphs instead of launching kernels eagerly
+
+Rows 1-3 use the eager evaluator, as when those changes were made, so each
+row isolates one change.
 
 mcts_copy_baseline.py is the tree before the push/pop change; the search
-results are identical (same visit counts), only the speed differs.
+results are identical (same visit counts), only the speed differs. The
+current tree runs with FPU and repetition draws off so the comparison is like
+for like (those later additions change which lines get searched).
 
-    python bench_mcts.py                   # all three, ~2-3 min on a 3070 Ti
+    python bench_mcts.py                   # all four, ~2-3 min on a 3070 Ti
     python bench_mcts.py --moves 2         # quicker, noisier
 """
 
@@ -87,12 +94,19 @@ def main():
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model, _ = load_checkpoint(args.checkpoint, device)
-    ev = Evaluator(model, device)
-    for b in (1, args.games):                           # warm up CUDA kernels
-        ev(np.zeros((b, 19, 8, 8), np.uint8))
+    ev = Evaluator(model, device, use_graphs=False)
+    ev_graphs = Evaluator(model, device)
+    for e in (ev, ev_graphs):                           # warm up / capture
+        for b in range(0, 7):
+            e(np.zeros((1 << b, 19, 8, 8), np.uint8))
 
     old = load_mcts(os.path.join(HERE, "mcts_copy_baseline.py"))
-    new = load_mcts(os.path.join(ENGINE_DIR, "mcts.py"))
+    new_cls = load_mcts(os.path.join(ENGINE_DIR, "mcts.py"))
+
+    def new(board, add_noise):
+        return new_cls(board, add_noise=add_noise,
+                       fpu_reduction=None, repetition_draws=False)
+
     print(f"device {device} | {args.games} games x {args.sims} sims/move\n")
 
     # The unbatched run is ~17x slower, so time a single move cycle.
@@ -101,12 +115,15 @@ def main():
                  run(old, ev, True, args.games, args.sims, args.moves)))
     rows.append(("batched   + push/pop",
                  run(new, ev, True, args.games, args.sims, args.moves)))
+    rows.append(("  + CUDA graphs",
+                 run(new, ev_graphs, True, args.games, args.sims, args.moves)))
 
     base = rows[0][1]
     print(f"{'variant':22s} {'sims/s':>8s} {'vs naive':>9s}")
     for name, rate in rows:
         print(f"{name:22s} {rate:8.0f} {rate / base:8.1f}x")
     print(f"\npush/pop over batched+copy: {rows[2][1] / rows[1][1] - 1:+.0%}")
+    print(f"CUDA graphs over eager:     {rows[3][1] / rows[2][1] - 1:+.0%}")
 
 
 if __name__ == "__main__":
