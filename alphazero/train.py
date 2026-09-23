@@ -11,6 +11,7 @@ Usage:
     python train.py                  # run until stopped
     python train.py --minutes 480    # stop (gracefully) after ~8 hours
     python train.py --blocks 10      # stop after 10 blocks
+    python train.py --workers 4      # self-play in 4 parallel processes
 
 Resume is automatic: just run train.py again. State lives in data/
 (checkpoint.pt + buffer shards) — delete the directory to start over.
@@ -29,6 +30,7 @@ from config import CFG
 from network import Evaluator, PolicyValueNet, load_checkpoint
 from replay_buffer import ReplayBuffer
 from selfplay import SelfPlayPool
+from selfplay_workers import SelfPlayWorkers
 
 LOG_PATH = os.path.join(CFG.data_dir, "train_log.csv")
 
@@ -137,6 +139,8 @@ def main():
                         help="stop gracefully after this many minutes")
     parser.add_argument("--blocks", type=int, default=None,
                         help="stop after this many blocks")
+    parser.add_argument("--workers", type=int, default=0,
+                        help="self-play processes (0 = self-play in this process)")
     args = parser.parse_args()
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -148,13 +152,41 @@ def main():
     stop = GracefulStop()
     model, optimizer, scaler, games, steps = load_state(device)
     buffer = ReplayBuffer()
-    pool = SelfPlayPool(Evaluator(model, device))
+    workers = pool = None
+    if args.workers > 0:
+        if not os.path.exists(CFG.checkpoint):
+            save_state(model, optimizer, scaler, games, steps)   # workers load it
+        workers = SelfPlayWorkers(args.workers, CFG.checkpoint, int(time.time()))
+        results = {"1-0": 0, "0-1": 0, "1/2-1/2": 0}
+        print(f"Self-play in {args.workers} worker processes")
+    else:
+        pool = SelfPlayPool(Evaluator(model, device))
+        results = pool.results
 
+    try:
+        _train_loop(args, stop, model, optimizer, scaler, buffer, pool, workers,
+                    results, games, steps, device)
+    finally:
+        if workers is not None:
+            workers.close()
+    print("Saved. Run train.py again to continue.")
+
+
+def _train_loop(args, stop, model, optimizer, scaler, buffer, pool, workers,
+                results, games, steps, device):
     deadline = time.time() + args.minutes * 60 if args.minutes else None
     block = 0
     while not stop.requested:
         t0 = time.time()
-        positions, finished = pool.play_block(buffer, CFG.games_per_block, stop)
+        if workers is not None:
+            positions = finished = 0
+            for records, z in workers.get_games(CFG.games_per_block, stop):
+                buffer.add_game(records, z)
+                positions += len(records)
+                finished += 1
+                results["1-0" if z == 1 else "0-1" if z == -1 else "1/2-1/2"] += 1
+        else:
+            positions, finished = pool.play_block(buffer, CFG.games_per_block, stop)
         games += finished
         gpm = finished / max((time.time() - t0) / 60, 1e-9)
 
@@ -168,11 +200,13 @@ def main():
         buffer.save()
         save_state(model, optimizer, scaler, games, steps)
         log_block(games, steps, buffer.size, p_loss, v_loss, gpm)
-        r = pool.results
+        r = results
         print(f"[block {block:4d}] games {games:,} ({gpm:.1f}/min) | "
               f"buffer {buffer.size:,} | steps {steps:,} | "
               f"loss p {p_loss:.3f} v {v_loss:.3f} | "
-              f"W/D/L {r['1-0']}/{r['1/2-1/2']}/{r['0-1']}", flush=True)
+              f"W/D/L {r['1-0']}/{r['1/2-1/2']}/{r['0-1']}"
+              + (f" | weight reloads {sorted(workers.reloads.values())}"
+                 if workers is not None else ""), flush=True)
 
         block += 1
         if args.blocks is not None and block >= args.blocks:
@@ -180,8 +214,6 @@ def main():
         if deadline is not None and time.time() >= deadline:
             print("Time limit reached.")
             break
-
-    print("Saved. Run train.py again to continue.")
 
 
 if __name__ == "__main__":

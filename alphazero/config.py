@@ -27,6 +27,8 @@ class Config:
     parallel_games: int = 64            # games played in lockstep (= GPU batch)
     temp_moves: int = 20                # sample moves ∝ visits for first N plies
     max_game_plies: int = 300           # adjudicate as draw beyond this
+    playout_cap_prob: float = 1.0       # <1: that share of moves get a full search (recorded)
+    fast_simulations: int = 32          # search size for the other moves (playout cap)
 
     # --- training ---
     batch_size: int = 512
