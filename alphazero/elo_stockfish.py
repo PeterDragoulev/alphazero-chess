@@ -35,6 +35,8 @@ from config import CFG
 from encoding import encode_board, move_to_index
 from mcts import MCTS
 from network import Evaluator, load_checkpoint
+from uci import clear_live, q_to_cp, write_live
+import live_viewer
 
 STOCKFISH = os.environ.get("STOCKFISH") or shutil.which("stockfish") or "stockfish"
 MAX_PLIES = 300
@@ -49,7 +51,10 @@ def main():
     ap.add_argument("--checkpoint", default=(CFG.checkpoint if os.path.exists(CFG.checkpoint)
                                              else CFG.pretrained_weights))
     ap.add_argument("--stockfish", default=STOCKFISH, help="path to a Stockfish binary")
+    ap.add_argument("--no-viewer", action="store_true", help="don't open live_viewer.py")
     args = ap.parse_args()
+    if not args.no_viewer:
+        live_viewer.ensure_running()
 
     dev = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model, ckpt = load_checkpoint(args.checkpoint, dev)
@@ -81,10 +86,15 @@ def main():
             games.append({"board": start.copy(), "us": chess.WHITE if we_white else chess.BLACK,
                           "tree": MCTS(start.copy()), "sf": sf, "result": None})
 
+    def publish(g, **extra):
+        write_live(g["board"], "white" if g["us"] == chess.WHITE else "black",
+                   key=f"sf{games.index(g) + 1}", **extra)
+
     def finish(g):
         o = g["board"].outcome(claim_draw=True)
         if o is None and g["board"].ply() < MAX_PLIES:
             return
+        clear_live(f"sf{games.index(g) + 1}")
         w = o.winner if o else None
         g["result"] = 0.5 if w is None else float(w == g["us"])
         g["sf"].quit()
@@ -125,9 +135,18 @@ def main():
                     g["tree"].expand_leaves(lg[i:i + k], vs[i:i + k])
                     i += k
         for g in ours:
-            play(g, g["tree"].best_move(0.0))
+            t = g["tree"]
+            move = t.best_move(0.0)
+            i = t.root.moves.index(move)
+            q = t.root.W[i] / max(t.root.N[i], 1)
+            play(g, move)
+            if g["result"] is None:
+                publish(g, eval_cp=q_to_cp(q), depth=t.depth_stats()["depth"],
+                        sims=args.sims)
         for g in theirs:
             play(g, futures[id(g)].result().move)
+            if g["result"] is None:
+                publish(g, thinking=True)
     pool.shutdown()
 
     r = np.array([g["result"] for g in games])
