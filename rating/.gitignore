@@ -1,0 +1,10 @@
+# downloaded / built by setup.sh
+fastchess
+fastchess-linux-x86-64/
+stash-src/
+build-*/
+stash-*.*
+8moves_v3.pgn
+# match output (results worth keeping are copied to ../results/ccrl/)
+match_*
+config.json
