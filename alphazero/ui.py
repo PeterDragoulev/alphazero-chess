@@ -5,7 +5,7 @@ ui.py — tkinter chess UI.  Structure identical to Act 2.3; engine swapped.
 import tkinter as tk
 import chess
 
-from engine import choose_move, _material_move, MODEL_PATH, _model
+from engine import choose_move, _material_move, MODEL_PATH, _model, last_search
 import os
 
 SQUARE_SIZE = 64
@@ -116,6 +116,12 @@ class ChessUI:
         except ValueError:
             self.set_status("Invalid UCI. Try something like e2e4 or g1f3.")
             return
+        if move.promotion is None and self._is_promotion(move):
+            promo = self.ask_promotion()
+            if promo is None:
+                self.set_status("Promotion cancelled.")
+                return
+            move.promotion = promo
         if move not in self.board.legal_moves:
             self.set_status("Illegal move for the side to move.")
             return
@@ -148,21 +154,69 @@ class ChessUI:
                 self.update_ui()
             elif square in self.valid_moves:
                 move = chess.Move(self.selected_square, square)
+                if self._is_promotion(move):
+                    move.promotion = self.ask_promotion()
+                    if move.promotion is None:
+                        self.selected_square = None
+                        self.valid_moves = set()
+                        self.set_status("Promotion cancelled.")
+                        self.update_ui()
+                        return
+                if move not in self.board.legal_moves:
+                    self.set_status("Illegal move.")
+                    return
                 self.push_move(move, source="You")
                 self.selected_square = None
                 self.valid_moves = set()
             else:
                 self.set_status("Invalid destination.")
 
+    def _is_promotion(self, move: chess.Move) -> bool:
+        """A pawn move to the last rank (needs a promotion piece to be legal)."""
+        return any(m.from_square == move.from_square
+                   and m.to_square == move.to_square and m.promotion
+                   for m in self.board.legal_moves)
+
+    def ask_promotion(self) -> int | None:
+        """Modal piece picker; returns a chess piece type, or None if closed."""
+        choice = {"piece": None}
+        dialog = tk.Toplevel(self.root)
+        dialog.title("Promote to")
+        dialog.transient(self.root)
+        dialog.resizable(False, False)
+        color = self.board.turn
+        for col, pt in enumerate((chess.QUEEN, chess.ROOK,
+                                  chess.BISHOP, chess.KNIGHT)):
+            def pick(pt=pt):
+                choice["piece"] = pt
+                dialog.destroy()
+            tk.Button(dialog, text=PIECE_ICONS[color][pt],
+                      font=("Segoe UI Symbol", 28), width=2,
+                      command=pick).grid(row=0, column=col, padx=4, pady=6)
+        dialog.bind("<q>", lambda e: (choice.update(piece=chess.QUEEN), dialog.destroy()))
+        dialog.bind("<Escape>", lambda e: dialog.destroy())
+        dialog.grab_set()
+        dialog.focus_set()
+        self.root.wait_window(dialog)
+        return choice["piece"]
+
     def engine_move(self) -> None:
         if self.board.is_game_over():
             self.set_status("Game over.")
             return
+        last_search.clear()
         move = choose_move(self.board)
         if move is None:
             self.set_status("No legal moves.")
             return
         self.push_move(move, source="Engine")
+        if last_search:                  # empty when book/tablebase answered
+            s = last_search
+            self.set_status(f"Engine played {move.uci()} — depth {s['depth']} "
+                            f"(sel {s['seldepth']}), {s['sims']} sims "
+                            f"+ {s['reused']} reused")
+        else:
+            self.set_status(f"Engine played {move.uci()} (book/tablebase)")
 
     def push_move(self, move: chess.Move, source: str) -> None:
         self.board.push(move)
