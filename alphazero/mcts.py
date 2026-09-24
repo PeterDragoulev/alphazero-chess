@@ -24,6 +24,10 @@ is exact and N/W only ever hold real results.
 
 Conventions:
   - Node statistics live on edges (numpy arrays per node, vectorized PUCT).
+  - Two implementations with one API: PyMCTS (this file, the reference) and
+    NativeMCTS (a thin wrapper over native/fastmcts.cpp, the same algorithm
+    in C++, ~10x faster). `MCTS` is the native one when the extension is
+    built (native/build.sh) and CFG.native_mcts is on, else PyMCTS.
   - The network value is from the perspective of the side to move at a node;
     it is negated at every step while backing up.
   - The tree owns a private search board (a stack-less copy of the live
@@ -84,7 +88,7 @@ def _position_keys(board: chess.Board) -> set:
 _COLLISION = object()     # _descend(): leaf already awaiting evaluation
 
 
-class MCTS:
+class PyMCTS:
     def __init__(self, board: chess.Board, add_noise: bool = False,
                  c_puct: float = CFG.c_puct,
                  fpu_reduction: float | None = CFG.fpu_reduction,
@@ -319,6 +323,16 @@ class MCTS:
         return {"depth": depth, "seldepth": seldepth,
                 "mean_depth": weighted / total if total else 0.0}
 
+    def pv(self, max_len: int = 64) -> list:
+        """Principal variation: most-visited move at each step."""
+        out, node = [], self.root
+        while (len(out) < max_len and node is not None and node.moves is not None
+               and node.N.sum() > 0):
+            i = int(np.argmax(node.N))
+            out.append(node.moves[i])
+            node = node.children[i]
+        return out
+
     def advance(self, move: chess.Move) -> None:
         """Play a move on the live board, reusing the subtree if we have it."""
         new_root = None
@@ -338,3 +352,107 @@ class MCTS:
                 self._apply_noise()
             else:
                 self._noise_pending = True
+
+
+# -- native tree ---------------------------------------------------------------------
+
+class _RootView:
+    """Read-only snapshot of the native root with PyMCTS's Node fields."""
+    __slots__ = ("moves", "N", "W", "P")
+
+    def __init__(self, tree):
+        if tree.root_expanded():
+            self.moves = [chess.Move.from_uci(u) for u in tree.root_moves()]
+            self.N, self.W, self.P = tree.root_N(), tree.root_W(), tree.root_P()
+        else:
+            self.moves = self.N = self.W = self.P = None
+
+
+class NativeMCTS:
+    """
+    PyMCTS's API over the C++ tree (native/fastmcts.cpp). Same search, same
+    rules; moves at a node are in a canonical order (from, to, promotion)
+    rather than python-chess's, so ties can break differently. `root` is a
+    snapshot (fresh arrays per access), not a live Node.
+    """
+
+    def __init__(self, board: chess.Board, add_noise: bool = False,
+                 c_puct: float = CFG.c_puct,
+                 fpu_reduction: float | None = CFG.fpu_reduction,
+                 repetition_draws: bool = True):
+        self.board = board                  # the live game board (shared)
+        start = board.root()
+        self._tree = fastmcts.Tree(
+            start.fen(), [m.uci() for m in board.move_stack],
+            -1 if board.ep_square is None else board.ep_square,
+            c_puct, fpu_reduction, repetition_draws)
+        self.add_noise = add_noise
+        self._noise_pending = add_noise
+
+    # -- search ----------------------------------------------------------------
+
+    def select_leaf(self) -> np.ndarray | None:
+        return self._tree.select_leaf()
+
+    def expand_backup(self, policy_logits: np.ndarray, value: float) -> None:
+        self._tree.expand_backup(policy_logits, float(value))
+        self._after_expand()
+
+    def select_leaves(self, k: int) -> tuple[list[np.ndarray], int]:
+        planes, sims = self._tree.select_leaves(k)
+        return list(planes), sims
+
+    def expand_leaves(self, policy_logits: np.ndarray, values: np.ndarray) -> None:
+        self._tree.expand_leaves(policy_logits, values)
+        self._after_expand()
+
+    def _after_expand(self) -> None:
+        if self._noise_pending and self._tree.root_expanded():
+            self._apply_noise()
+
+    def _apply_noise(self) -> None:
+        self._noise_pending = False
+        p = self._tree.root_P()
+        noise = np.random.dirichlet([CFG.dirichlet_alpha] * len(p)).astype(np.float32)
+        self._tree.set_root_P((1 - CFG.dirichlet_eps) * p + CFG.dirichlet_eps * noise)
+
+    # -- results -------------------------------------------------------------------
+
+    @property
+    def root(self) -> _RootView:
+        return _RootView(self._tree)
+
+    def visit_counts(self):
+        return ([chess.Move.from_uci(u) for u in self._tree.root_moves()],
+                self._tree.root_N())
+
+    def best_move(self, temperature: float = 0.0) -> chess.Move:
+        moves, counts = self._tree.root_moves(), self._tree.root_N()
+        if temperature <= 0:
+            return chess.Move.from_uci(moves[int(np.argmax(counts))])
+        probs = counts.astype(np.float64) ** (1.0 / temperature)
+        probs /= probs.sum()
+        return chess.Move.from_uci(moves[int(np.random.choice(len(probs), p=probs))])
+
+    def depth_stats(self) -> dict:
+        return self._tree.depth_stats()
+
+    def pv(self, max_len: int = 64) -> list:
+        return [chess.Move.from_uci(u) for u in self._tree.pv(max_len)]
+
+    def advance(self, move: chess.Move) -> None:
+        self._tree.advance(move.uci())
+        self.board.push(move)
+        if self.add_noise:
+            if self._tree.root_expanded():
+                self._apply_noise()
+            else:
+                self._noise_pending = True
+
+
+try:
+    import fastmcts
+except ImportError:                  # not built: native/build.sh
+    fastmcts = None
+
+MCTS = NativeMCTS if (fastmcts is not None and CFG.native_mcts) else PyMCTS

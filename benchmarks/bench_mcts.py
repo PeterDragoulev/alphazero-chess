@@ -13,6 +13,10 @@ move, the pretrained net, Dirichlet noise at the root) three ways:
                          once per leaf
   4. + CUDA graphs       the same, with the evaluator replaying captured CUDA
                          graphs instead of launching kernels eagerly
+  5. + native tree       the same search in C++ (alphazero/native/fastmcts.cpp):
+                         move generation, selection, backup and encoding
+                         native, Python only calls the network. Skipped if
+                         not built (alphazero/native/build.sh)
 
 Rows 1-3 use the eager evaluator, as when those changes were made, so each
 row isolates one change.
@@ -22,7 +26,7 @@ results are identical (same visit counts), only the speed differs. The
 current tree runs with FPU and repetition draws off so the comparison is like
 for like (those later additions change which lines get searched).
 
-    python bench_mcts.py                   # all four, ~2-3 min on a 3070 Ti
+    python bench_mcts.py                   # all five, ~2-3 min on a 3070 Ti
     python bench_mcts.py --moves 2         # quicker, noisier
 """
 
@@ -48,7 +52,7 @@ def load_mcts(path):
     spec = importlib.util.spec_from_file_location(os.path.basename(path), path)
     mod = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(mod)
-    return mod.MCTS
+    return mod
 
 
 def run(MCTS, ev, batched, games, sims, moves, seed=0):
@@ -100,12 +104,16 @@ def main():
         for b in range(0, 7):
             e(np.zeros((1 << b, 19, 8, 8), np.uint8))
 
-    old = load_mcts(os.path.join(HERE, "mcts_copy_baseline.py"))
-    new_cls = load_mcts(os.path.join(ENGINE_DIR, "mcts.py"))
+    old = load_mcts(os.path.join(HERE, "mcts_copy_baseline.py")).MCTS
+    engine_mcts = load_mcts(os.path.join(ENGINE_DIR, "mcts.py"))
 
-    def new(board, add_noise):
-        return new_cls(board, add_noise=add_noise,
-                       fpu_reduction=None, repetition_draws=False)
+    def new(board, add_noise):                      # the Python tree
+        return engine_mcts.PyMCTS(board, add_noise=add_noise,
+                                  fpu_reduction=None, repetition_draws=False)
+
+    def native(board, add_noise):                   # the same search in C++
+        return engine_mcts.NativeMCTS(board, add_noise=add_noise,
+                                      fpu_reduction=None, repetition_draws=False)
 
     print(f"device {device} | {args.games} games x {args.sims} sims/move\n")
 
@@ -117,6 +125,9 @@ def main():
                  run(new, ev, True, args.games, args.sims, args.moves)))
     rows.append(("  + CUDA graphs",
                  run(new, ev_graphs, True, args.games, args.sims, args.moves)))
+    if engine_mcts.fastmcts is not None:
+        rows.append(("  + native tree",
+                     run(native, ev_graphs, True, args.games, args.sims, args.moves)))
 
     base = rows[0][1]
     print(f"{'variant':22s} {'sims/s':>8s} {'vs naive':>9s}")
@@ -124,6 +135,10 @@ def main():
         print(f"{name:22s} {rate:8.0f} {rate / base:8.1f}x")
     print(f"\npush/pop over batched+copy: {rows[2][1] / rows[1][1] - 1:+.0%}")
     print(f"CUDA graphs over eager:     {rows[3][1] / rows[2][1] - 1:+.0%}")
+    if len(rows) > 4:
+        print(f"native tree over Python:    {rows[4][1] / rows[3][1]:.1f}x")
+    else:
+        print("(native tree not built: alphazero/native/build.sh)")
 
 
 if __name__ == "__main__":

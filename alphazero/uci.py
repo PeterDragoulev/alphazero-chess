@@ -96,7 +96,15 @@ class Engine:
 
     # -- commands -------------------------------------------------------------
 
+    def finish_search(self):
+        """Stop and wait for a running search (a GUI should send `stop` first,
+        but a new position/go mid-search must never touch a busy tree)."""
+        if self.search_thread is not None and self.search_thread.is_alive():
+            self.stop.set()
+            self.search_thread.join()
+
     def position(self, tokens):
+        self.finish_search()
         if tokens and tokens[0] == "startpos":
             board, rest = chess.Board(), tokens[1:]
         elif tokens and tokens[0] == "fen":
@@ -121,6 +129,7 @@ class Engine:
                 args[key] = True
                 i += 1
         self.loaded.wait()
+        self.finish_search()
         self.stop.clear()
         self.search_thread = threading.Thread(target=self._search, args=(args,),
                                               daemon=True)
@@ -166,7 +175,7 @@ class Engine:
         deadline = None if budget is None else t0 + budget
         max_sims = args.get("nodes")
         tree = e._tree_for(board)
-        done, last_info = 0, t0
+        done, last_info, only_move = 0, t0, None
         while not self.stop.is_set():
             if deadline is not None and time.time() >= deadline:
                 break
@@ -181,7 +190,9 @@ class Engine:
             if time.time() - last_info > 1.0:
                 self._info(tree, done, t0)
                 last_info = time.time()
-            if len(tree.root.moves or ()) == 1 and done >= 1:
+            if only_move is None and done >= 1:
+                only_move = len(tree.root.moves or ()) == 1
+            if only_move:
                 break                        # only one legal move: play it
         self._info(tree, done, t0)
         best = tree.best_move(temperature=0.0)
@@ -201,15 +212,11 @@ class Engine:
         best = int(np.argmax(root.N))
         q = root.W[best] / root.N[best]
         stats = tree.depth_stats()
-        pv, node = [], root
-        while node is not None and node.moves is not None and node.N.sum() > 0:
-            i = int(np.argmax(node.N))
-            pv.append(node.moves[i].uci())
-            node = node.children[i]
+        pv = [m.uci() for m in tree.pv(20)]
         elapsed = max(time.time() - t0, 1e-3)
         send(f"info depth {stats['depth']} seldepth {stats['seldepth']} "
              f"nodes {sims} nps {int(sims / elapsed)} time {int(elapsed * 1000)} "
-             f"score cp {q_to_cp(q)} pv {' '.join(pv[:20])}")
+             f"score cp {q_to_cp(q)} pv {' '.join(pv)}")
 
 
 def main():
@@ -235,15 +242,14 @@ def main():
                 eng.options[name] = value
         elif cmd == "ucinewgame":
             eng.loaded.wait()
+            eng.finish_search()
             eng.engine._tree = None          # don't reuse a tree across games
         elif cmd == "position":
             eng.position(rest)
         elif cmd == "go":
             eng.go(rest)
         elif cmd == "stop":
-            eng.stop.set()
-            if eng.search_thread is not None:
-                eng.search_thread.join()
+            eng.finish_search()
         elif cmd == "quit":
             eng.stop.set()
             clear_live()

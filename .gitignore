@@ -15,3 +15,6 @@ alphazero/books/
 # master-games PGN for finetune_otb.sh (not redistributable here)
 alphazero/pgn/
 alphazero/backups/
+
+# native search tree, built by alphazero/native/build.sh
+*.so

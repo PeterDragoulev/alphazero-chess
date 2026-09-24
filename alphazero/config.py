@@ -19,6 +19,7 @@ class Config:
     # --- MCTS ---
     c_puct: float = 1.5
     fpu_reduction: float = 0.25         # unvisited move Q = parent Q - this*sqrt(explored prior)
+    native_mcts: bool = True            # C++ tree (native/build.sh) when built; False = mcts.PyMCTS
     dirichlet_alpha: float = 0.3
     dirichlet_eps: float = 0.25
 

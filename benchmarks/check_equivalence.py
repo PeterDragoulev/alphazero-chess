@@ -45,7 +45,8 @@ def load(path, name):
 def trace(mod, ev, fen, plies=6, sims=200):
     np.random.seed(1)
     board = chess.Board(fen)
-    tree = mod.MCTS(board, add_noise=True, **CLASSIC.get(mod.__name__, {}))
+    cls = getattr(mod, "PyMCTS", mod.MCTS)          # the Python tree
+    tree = cls(board, add_noise=True, **CLASSIC.get(mod.__name__, {}))
     out = []
     for _ in range(plies):
         if board.outcome(claim_draw=True):

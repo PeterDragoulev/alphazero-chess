@@ -3,3 +3,4 @@ numpy
 torch>=2.0
 datasets>=2.14
 huggingface_hub
+pybind11>=2.12       # native search tree (alphazero/native/build.sh)
