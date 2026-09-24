@@ -1,0 +1,20 @@
+Indexing opening suite...
+Started game 1 of 5 (FineTuned vs PreFineTune)
+Started game 2 of 5 (PreFineTune vs FineTuned)
+Finished game 2 (PreFineTune vs FineTuned): 1-0 {White mates}
+Started game 3 of 5 (FineTuned vs PreFineTune)
+Finished game 1 (FineTuned vs PreFineTune): 0-1 {Black mates}
+Started game 4 of 5 (PreFineTune vs FineTuned)
+Finished game 4 (PreFineTune vs FineTuned): 0-1 {Black mates}
+Started game 5 of 5 (FineTuned vs PreFineTune)
+Finished game 3 (FineTuned vs PreFineTune): 1-0 {White mates}
+Finished game 5 (FineTuned vs PreFineTune): 1-0 {White mates}
+--------------------------------------------------
+Results of FineTuned vs PreFineTune (40/120, NULL, NULL, 8moves_v3.pgn):
+Elo: 70.44 +/- -nan, nElo: 70.92 +/- 304.54
+LOS: 67.60 %, DrawRatio: 0.00 %
+Games: 5, Wins: 3, Losses: 2, Draws: 0, Points: 3.0 (60.00 %)
+--------------------------------------------------
+Finished match
+Total Time: 00:23:11 (hours:minutes:seconds)
+

@@ -8,7 +8,9 @@ resumed without losing data; shards that have been fully overwritten in the
 ring are deleted.
 
 Policy targets are stored sparse (legal-move indices + probabilities) and
-densified per batch at sample time.
+densified per batch at sample time. Value targets are float16 in [-1, 1]
+(game results are -1/0/1; pretrain.py can blend in engine evals). Shards
+written before that stored int8 results and still load.
 """
 
 import json
@@ -27,7 +29,7 @@ class ReplayBuffer:
         self.capacity = capacity
         self.total = 0                       # positions ever added
         self.planes = np.zeros((capacity, PLANES, 8, 8), dtype=np.uint8)
-        self.z = np.zeros(capacity, dtype=np.int8)
+        self.z = np.zeros(capacity, dtype=np.float16)
         self.policies = [None] * capacity    # (idx u16 array, prob f16 array)
         self._unsaved = []                   # adds since last save()
         os.makedirs(self.dir, exist_ok=True)
@@ -39,7 +41,7 @@ class ReplayBuffer:
 
     # -- adding -------------------------------------------------------------
 
-    def add(self, planes_u8, pol_idx, pol_prob, z: int) -> None:
+    def add(self, planes_u8, pol_idx, pol_prob, z: float) -> None:
         row = self.total % self.capacity
         self.planes[row] = planes_u8
         self.z[row] = z
@@ -74,7 +76,7 @@ class ReplayBuffer:
             np.savez_compressed(
                 path,
                 planes=np.stack([p[0] for p in self._unsaved]),
-                z=np.array([p[3] for p in self._unsaved], dtype=np.int8),
+                z=np.array([p[3] for p in self._unsaved], dtype=np.float16),
                 pol_idx=np.concatenate([p[1] for p in self._unsaved]),
                 pol_prob=np.concatenate([p[2] for p in self._unsaved]),
                 pol_lens=pol_lens,
