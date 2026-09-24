@@ -4,23 +4,26 @@ A chess engine built up in stages, from classical game-tree search to an
 AlphaZero-style policy-value network guided by Monte-Carlo Tree Search, and
 trained entirely on one laptop GPU (RTX 3070 Ti, 8 GB VRAM).
 
-> **Strength: about 2,850–2,900 Elo against strength-limited Stockfish.**
-> At equal thinking time the engine plays Stockfish 19 set to `UCI_Elo 2900`
-> roughly even (+1 =7 −2) and beats it at 2700 (+6 =3 −1). This is on
-> Stockfish's computer-rating scale, not a FIDE or chess.com rating; see
-> [Strength vs Stockfish](#strength-vs-stockfish).
+> **Strength: roughly 2,950 on the CCRL 40/15 computer rating list**
+> (rough estimate from short matches against Stash 23.0 and 27.0, engines with
+> published CCRL ratings of 2902 and 3022), and about 2,850–2,900 against
+> strength-limited Stockfish. These are computer-rating scales, not FIDE or
+> chess.com ratings; see [Results](#results).
 
 | Stage | Folder | Idea |
 |---|---|---|
 | 1 | [`1_search/`](1_search) | Minimax, then alpha-beta pruning over a material evaluator |
 | 2 | [`2_value_net/`](2_value_net) | Replace the hand-written evaluator with a supervised CNN value network |
 | 3 | [`alphazero/`](alphazero) | Policy + value ResNet, PUCT MCTS, supervised pretraining on Lichess, then self-play |
-| — | [`benchmarks/`](benchmarks) | Reproducible MCTS speedup benchmark (batched leaf evaluation, push/pop traversal) |
+| — | [`benchmarks/`](benchmarks) | Reproducible MCTS speedup benchmark (batched leaf evaluation, push/pop traversal, native tree) |
+| — | [`rating/`](rating) | CCRL-anchored matches (fastchess vs Stash) through the UCI interface |
 
 **Headline numbers** (all measured on this repo; see [Results](#results)):
 
-- **~2,850–2,900 Elo vs strength-limited Stockfish** (UCI_Elo scale), from 40
-  games at four levels.
+- **~2,950 CCRL 40/15** (rough, from 5-game matches at 40 moves / 2 min: 3–2 vs
+  Stash 23.0 at 2902, 2–3 vs Stash 27.0 at 3022; after the master-games
+  fine-tune, 3–2 vs Stash 27.0) and **~2,850–2,900 vs strength-limited
+  Stockfish** (UCI_Elo scale, 40 games at four levels).
 - Alpha-beta finds the same move scores as minimax while searching **7–52x fewer nodes**.
 - Self-play MCTS runs **~16–18x faster** than the naive implementation:
   ~14–17x from batching leaf evaluations across 64 games into single GPU calls,
@@ -32,6 +35,9 @@ trained entirely on one laptop GPU (RTX 3070 Ti, 8 GB VRAM).
 - Play-time search is **4x faster** per simulation (virtual-loss batching within
   one tree, CUDA graphs, tree reuse), which in the same ~1.2 s per move takes
   the principal variation from **~12 to ~17 plies**.
+- The search tree in C++ (`alphazero/native/`): **identical visit counts** to
+  the Python tree, **~4x more simulations per second** in play and ~3x in
+  self-play; search is now bound by GPU calls, not Python.
 - Pretraining ingestion went from ~4,300 to **~6,900 positions/s** with
   parallel worker processes and a 1.9x faster board encoder.
 
@@ -101,14 +107,19 @@ promising lines.
 
 ```
 pretrain.py     supervised: streams Lichess games, policy = move played, value = result
+                blended with Stockfish evals; optional master-games PGN mix-in
 train.py        self-play loop: self-play block → gradient steps → checkpoint, repeat
 selfplay.py     64 games in lockstep; all their MCTS leaves evaluated in ONE GPU batch
-mcts.py         PUCT search with externalized (batchable) evaluation, push/pop traversal
+selfplay_workers.py  self-play in N processes feeding one trainer (train.py --workers)
+mcts.py         PUCT search with externalized (batchable) evaluation: PyMCTS (Python,
+                the reference) and NativeMCTS (same tree in C++, native/fastmcts.cpp)
 network.py      policy + value ResNet (3.66M params), fp16 batched Evaluator
 encoding.py     board → (19,8,8) uint8 planes; move → AlphaZero 73×64 policy index
 replay_buffer.py disk-persisted 500k-position ring buffer, sparse policy targets
 engine.py       play interface: opening book → endgame tablebase → MCTS
 evaluate.py     checkpoint-vs-checkpoint arena with Elo estimate
+uci.py          UCI protocol with time management (uci_engine.sh = the executable)
+live_viewer.py  watch running games live (one board per game)
 config.py       every hyperparameter in one place
 ```
 
@@ -210,7 +221,23 @@ produces ~5,000. So the net is first trained on strong human games:
   dataset, with no full download. Filters: both players rated ≥ 2000, no
   bullet, normal termination, at least 10 plies.
 - Policy target = the move actually played (one-hot). Value target = the game
-  result, from the side to move's perspective.
+  result from the side to move's perspective, blended 50/50 with Stockfish's
+  evaluation where the game has one (below).
+- **Stockfish-eval value targets:** Lichess analyses many games server-side
+  and stores the evals in the movetext as `[%eval]` comments: ~9% of all
+  games, but ~60% of 2400+ non-bullet games. A game result is a noisy label
+  for early positions (a won position thrown away later reads as a loss); an
+  eval is not. Evals are converted to expected score with Lichess's own
+  win-chance curve (1 pawn ≈ +0.18, 3 pawns ≈ +0.51, mate = ±1) and blended
+  with the result (`--eval-weight`, default 0.5). Parsing them costs nothing
+  measurable (~20k positions/s per core).
+- **Master-games fine-tune (`finetune_otb.sh`):** `--pgn` mixes a local PGN
+  into the stream. The fine-tune used over-the-board classical games with
+  both players 2500+ (272k games, Lumbra's GigaBase; not redistributed here),
+  50/50 with Lichess 2400+, at lr 3e-5 for 150 minutes. It backs up the
+  checkpoint and buffer first; `revert_finetune.sh` undoes it. The fine-tuned
+  net went 3–2 against Stash 27.0 (the net before it: 2–3) and 3–2 head to
+  head against its predecessor; these are the shipped weights.
 - **Memory fix:** the dataset library's streaming `.shuffle()` grew to ~10 GB
   of RAM and got the process OOM-killed on an 11 GB machine. It is replaced by
   shuffling the order of the ~26k monthly parquet shards and reading them
@@ -224,7 +251,7 @@ produces ~5,000. So the net is first trained on strong human games:
 - **Leak containment:** the streaming stack (`datasets`/pyarrow) leaks about
   1 GB per hour per process, and after two hours it nearly ran the machine out
   of memory. Each worker is now a small supervisor that runs the stream in a
-  fresh child process and replaces it every 30k games (~13 minutes). The child
+  fresh child process and replaces it every 30k games or 5 minutes. The child
   flushes its queue before exiting, so no games are lost. Replacing children
   much more often trips HuggingFace's API rate limit (1,000 requests per 5
   minutes), because each new child lists the dataset.
@@ -243,6 +270,12 @@ loop:
   the final game result z as the value target.
 - Every 32 finished games, the net runs gradient steps proportional to the new
   data (each position is sampled about twice).
+- **Parallel self-play (`--workers N`):** self-play is bound by single-threaded
+  tree search, so N processes each run their own game pool with a copy of the
+  net and send finished games to the trainer over a queue; they reload the
+  weights whenever the checkpoint changes (in place, so CUDA graphs stay
+  valid). Optional playout-cap randomization gives a share of moves a full
+  search (recorded as training data) and the rest a cheap one.
 
 **Replay buffer (`replay_buffer.py`):** a 500k-position ring buffer (~600 MB
 of RAM). Policy targets are stored *sparse* (legal-move indices plus fp16
@@ -308,6 +341,28 @@ only a few percent at self-play batch sizes. `benchmarks/check_equivalence.py` v
 produces **exactly the same visit counts and values** as the copy-based
 baseline (`mcts_copy_baseline.py`), including checkmate, stalemate and
 50-move-rule positions. It is a pure speedup with no change in behavior.
+
+**Native tree.** After those changes the remaining cost was Python itself:
+at ~1,150 simulations/s in a play search, two thirds of the time went to
+python-chess move generation and push/pop, the PUCT arithmetic and
+encoding. `alphazero/native/fastmcts.cpp` (pybind11, move generation from the
+MIT-licensed [chess-library](https://github.com/Disservin/chess-library))
+reimplements the whole tree — PUCT with FPU, virtual loss, repetition draws,
+terminal detection, board encoding, move indexing, tree reuse — and leaves
+Python only the network call.
+
+- `native/check_native.py` checks it against the Python tree on the same
+  positions with the same net: legal moves, policy indices, terminal verdicts
+  and encoding match python-chess on 411 positions / 11,434 moves, and **all
+  80 searches give identical visit counts** (single-leaf and batched, across
+  tree reuse). Moves are kept in a canonical order in both for this check.
+- CPU cost per simulation fell about 15x; a play search at 16 leaves per GPU
+  call went from **~1,150 to ~4,800 simulations/s**, and self-play in a small
+  test ran 3.1x faster (both measured while training shared the GPU). The
+  search is now limited by GPU calls: with 64 leaves per call it reached
+  ~17,000 simulations/s.
+- Build: `alphazero/native/build.sh` (g++ and pybind11). Without it the
+  engine falls back to the Python tree automatically.
 
 **Play-time search.** A game against one opponent has only one tree, so the
 batching above doesn't apply. Three changes speed up that case:
@@ -397,10 +452,27 @@ The two equal-time matches agree to within 25 points, which puts the engine at
 
 Logs are in [`results/stockfish/`](results/stockfish).
 
-The shipped weights are this continued-pretraining net
-(`alphazero/weights/lichess_5.66M_128x10.pt`, fp16, 7 MB; 5.66M games). The
-June pretrained net is kept as `alphazero/weights/pretrained_128x10.pt`,
+The Stockfish matches above used the 5.66M-game net
+(`alphazero/weights/lichess_5.66M_128x10.pt`). The shipped default is now the
+master-games fine-tuned net (`lichess_otb_7.12M_128x10.pt`, fp16, 7 MB;
+7.12M games). The June pretrained net is kept as `pretrained_128x10.pt`,
 because the older results above were measured with it.
+
+### CCRL-anchored rating
+
+Stockfish's `UCI_Elo` is only loosely tied to rating lists, so the engine also
+played engines that *are* on one: Stash 23.0 and 27.0 (CCRL 40/15 ratings 2902
+and 3022), through the UCI interface with fastchess, at 40 moves in 2 minutes
+from the 8-move opening suite used in Stockfish testing:
+
+| Our net | Opponent | Result | Implied |
+|---|---|---|---|
+| 6.5M-game Lichess 2400+ | Stash 23.0 (2902) | +3 =0 −2 | ~2970 |
+| same | Stash 27.0 (3022) | +1 =2 −2 | ~2950 |
+| + master-games fine-tune | Stash 27.0 (3022) | +2 =2 −1 | ~3090 |
+
+Together: **roughly 2,950 CCRL 40/15**, with wide error bars (5 games per
+match). Logs and PGNs: [`results/ccrl/`](results/ccrl).
 
 ---
 
@@ -422,9 +494,18 @@ CHESS_MODEL=data/other.pt python ui.py   # play a specific checkpoint
 python benchmarks/check_equivalence.py
 python benchmarks/bench_mcts.py
 
+# Faster search: build the native tree (optional, ~15 s; needs g++)
+alphazero/native/build.sh && python alphazero/native/check_native.py
+
 # Rating against strength-limited Stockfish (needs a stockfish binary)
 cd alphazero && python elo_stockfish.py --elo 2700 --sf-time 3
+
+# CCRL-anchored rating through UCI: fastchess vs Stash (CCRL 2902 / 3022)
+rating/setup.sh && GAMES=10 rating/run_match.sh 27.0
 ```
+
+`alphazero/uci_engine.sh` is a standard UCI engine: register it in any chess
+GUI (Arena, Cute Chess, Banksia) or match runner.
 
 Training (run inside `alphazero/`; state lives in `alphazero/data/`):
 
@@ -442,14 +523,15 @@ Set `HF_TOKEN` for higher HuggingFace rate limits on long pretraining runs.
 
 ## Limitations and next steps
 
-- Board operations run in Python (python-chess). A C++ move generator, or
-  running self-play workers in several processes feeding one GPU batch, is
-  the next big throughput lever.
+- With the native tree, search is bound by GPU calls. Larger virtual-loss
+  batches (more simulations/s, slightly less effective per simulation) and
+  overlapping CPU and GPU work are the next levers; the best batch size needs
+  a strength test, not just a speed test.
+- The rating numbers come from 5–10 game matches; they are rough (±200–300).
 - `evaluate.py` still evaluates one leaf at a time. Batching arena games the
   way `selfplay.py` does would speed up evaluation a lot.
 - The learning rate is lowered by hand when the loss plateaus (1e-3 → 3e-4 →
-  1e-4 so far). Training on 2400+ games is next. An automatic reduce-on-plateau schedule is the obvious next
-  step.
+  1e-4). An automatic reduce-on-plateau schedule is the obvious next step.
 - The network has no history planes, so it can't see repetitions itself;
   only the search can.
 - The checkpoint records `{channels, blocks}`, so a larger network can be
