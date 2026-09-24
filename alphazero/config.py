@@ -14,6 +14,7 @@ class Config:
     input_planes: int = 19
     channels: int = 128
     blocks: int = 10
+    se: bool = False                    # squeeze-and-excitation in each block (fresh nets; checkpoints record their own)
     policy_size: int = 73 * 64          # AlphaZero move encoding: 4672
 
     # --- MCTS ---

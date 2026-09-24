@@ -84,7 +84,7 @@ def save_state(model, optimizer, scaler, games, steps):
         "model": model.state_dict(),
         "optimizer": optimizer.state_dict(),
         "scaler": scaler.state_dict(),
-        "net": {"channels": CFG.channels, "blocks": CFG.blocks},
+        "net": model.net_config,             # the model's own shape, not CFG's
         "games": games,
         "steps": steps,
     }, tmp)
