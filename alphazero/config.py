@@ -21,6 +21,15 @@ class Config:
     c_puct: float = 1.5
     fpu_reduction: float = 0.25         # unvisited move Q = parent Q - this*sqrt(explored prior)
     native_mcts: bool = True            # C++ tree (native/build.sh) when built; False = mcts.PyMCTS
+    policy_temp: float = 1.3            # native only: priors = softmax(logits / T); 1.3 tuned (+38 Elo @3200 nodes)
+    cpuct_base: float = 38739.0         # native only: c_puct grows as c + factor*ln((N+base)/base)
+    cpuct_factor: float = 0.0           #   (0 = constant c_puct, the original rule)
+    contempt: float = 0.0               # native only: draws = -contempt for us when root Q > threshold
+    contempt_threshold: float = 0.1
+    q_select: float = 0.0               # native: final move = best Q among moves with >= this share of max visits (0 = most visits)
+    eval_cache: int = 0                 # native: cached network outputs for transpositions (entries; 0 = off)
+    solver: bool = False                # native: MCTS-solver (proven mates propagate up the tree)
+    smart_time: bool = False            # UCI: stop early if the best move can't be caught; extend (<=1.5x) if unstable
     dirichlet_alpha: float = 0.3
     dirichlet_eps: float = 0.25
 
@@ -45,7 +54,8 @@ class Config:
 
     # --- play (engine.py / evaluate.py) ---
     play_simulations: int = 6400          # new sims per move (batched, tree reused: ~5 s)
-    play_batch: int = 16                # leaves per GPU call when playing (virtual loss)
+    play_batch: int = 32                # leaves per GPU call when playing (virtual loss); 32 tuned: +115 Elo vs 16 at equal time
+    play_pipeline: bool = False         # native: keep 2 batches in flight (CPU selects while GPU evaluates)
 
     # --- paths ---
     data_dir: str = "data"

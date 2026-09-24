@@ -388,6 +388,51 @@ class NativeMCTS:
             c_puct, fpu_reduction, repetition_draws)
         self.add_noise = add_noise
         self._noise_pending = add_noise
+        self._last_q = 0.0                  # Q of the last move chosen (contempt)
+        if CFG.eval_cache:
+            self._tree.set_cache(CFG.eval_cache)
+        if CFG.solver:
+            self._tree.set_solver(True)
+        self.q_select = CFG.q_select        # >0: final move = best Q among moves
+                                            # with >= this share of the top visits
+        if (CFG.policy_temp, CFG.cpuct_factor) != (1.0, 0.0):
+            self.set_search_params(CFG.policy_temp, CFG.cpuct_base, CFG.cpuct_factor)
+
+    def update_contempt(self, contempt: float | None = None,
+                        threshold: float | None = None) -> float:
+        """Before a search: if we think we're better (root Q, or the last
+        move's Q when the root is fresh, above `threshold`), score draws in
+        the tree as -contempt for us, so a winning side steers away from
+        repetitions and dead-drawn lines. Returns the contempt applied."""
+        contempt = CFG.contempt if contempt is None else contempt
+        threshold = CFG.contempt_threshold if threshold is None else threshold
+        n, w = self._tree.root_N(), self._tree.root_W()
+        q = float(w.sum() / n.sum()) if n.size and n.sum() > 0 else self._last_q
+        c = contempt if (contempt > 0 and q > threshold) else 0.0
+        self._tree.set_contempt(c)
+        return c
+
+    def set_solver(self, on: bool) -> None:
+        """MCTS-solver: propagate proven mates up the tree."""
+        self._tree.set_solver(bool(on))
+
+    def set_cache(self, entries: int) -> None:
+        """Network-output cache for transpositions (0 = off)."""
+        self._tree.set_cache(int(entries))
+
+    def cache_stats(self) -> tuple[int, int, int]:
+        """(lookups, hits, entries)."""
+        return self._tree.cache_stats()
+
+    def set_root_fpu(self, value: float | None) -> None:
+        """Absolute Q for unvisited moves at the root (None = the normal FPU)."""
+        self._tree.set_root_fpu(float("nan") if value is None else value)
+
+    def set_search_params(self, policy_temp: float = 1.0, cpuct_base: float = 38739.0,
+                          cpuct_factor: float = 0.0) -> None:
+        """Native-only knobs: prior softmax temperature and Lc0-style c_puct
+        growth c(N) = c_puct + factor*ln((N+base)/base). Defaults = PyMCTS."""
+        self._tree.set_search_params(policy_temp, cpuct_base, cpuct_factor)
 
     # -- search ----------------------------------------------------------------
 
@@ -399,8 +444,13 @@ class NativeMCTS:
         self._after_expand()
 
     def select_leaves(self, k: int) -> tuple[list[np.ndarray], int]:
+        """Like PyMCTS.select_leaves, but more batches may be selected before
+        answering (pipelining); expand_leaves() answers the oldest."""
         planes, sims = self._tree.select_leaves(k)
         return list(planes), sims
+
+    def pending_batches(self) -> int:
+        return self._tree.pending_batches()
 
     def expand_leaves(self, policy_logits: np.ndarray, values: np.ndarray) -> None:
         self._tree.expand_leaves(policy_logits, values)
@@ -429,7 +479,23 @@ class NativeMCTS:
     def best_move(self, temperature: float = 0.0) -> chess.Move:
         moves, counts = self._tree.root_moves(), self._tree.root_N()
         if temperature <= 0:
-            return chess.Move.from_uci(moves[int(np.argmax(counts))])
+            i = int(np.argmax(counts))
+            w = self._tree.root_W()
+            proven = np.array(self._tree.root_proven())
+            if proven.size and (proven == 1).any():          # a proven win: take it
+                wins = np.flatnonzero(proven == 1)
+                i = int(wins[np.argmax(counts[wins])])
+                self._last_q = 1.0
+                return chess.Move.from_uci(moves[i])
+            if proven.size and (proven == -1).any() and not (proven == -1).all():
+                counts = np.where(proven == -1, -1, counts)  # never walk into a proven loss
+                i = int(np.argmax(counts))
+            if self.q_select > 0:
+                q = w / np.maximum(counts, 1)
+                ok = counts >= self.q_select * counts[i]
+                i = int(np.flatnonzero(ok)[np.argmax(q[ok])])
+            self._last_q = float(w[i] / max(counts[i], 1))
+            return chess.Move.from_uci(moves[i])
         probs = counts.astype(np.float64) ** (1.0 / temperature)
         probs /= probs.sum()
         return chess.Move.from_uci(moves[int(np.random.choice(len(probs), p=probs))])

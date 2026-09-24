@@ -47,8 +47,11 @@ def run(tree, ev, sims, batch):
 
 
 def main():
-    dev = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     from config import CFG
+    CFG.policy_temp = 1.0                    # PyMCTS has no temperature knob
+    CFG.eval_cache = 0                       # ... nor an eval cache or solver
+    CFG.solver = False
+    dev = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     here = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
     default = os.path.join(here, CFG.checkpoint)
     if not os.path.exists(default):

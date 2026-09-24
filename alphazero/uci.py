@@ -72,7 +72,7 @@ def clear_live(key=None):
 class Engine:
     def __init__(self):
         self.board = chess.Board()
-        self.options = {"OwnBook": False, "Tablebase": False}
+        self.options = {"OwnBook": False, "Tablebase": True}   # Lichess online 7-piece TB
         self.engine = None                   # the engine module, loaded lazily
         self.loaded = threading.Event()
         self.stop = threading.Event()
@@ -86,10 +86,12 @@ class Engine:
             import engine
         # Capture the CUDA graphs for every batch size search can use now, so
         # the one-time capture cost never lands on a move's clock.
-        if engine._evaluator is not None:
+        for ev in (engine._evaluator, engine._evaluator2):
+            if ev is None:
+                continue
             b = 1
             while b <= engine.CFG.play_batch:
-                engine._evaluator(np.zeros((b, 19, 8, 8), dtype=np.uint8))
+                ev(np.zeros((b, 19, 8, 8), dtype=np.uint8))
                 b *= 2
         self.engine = engine
         self.loaded.set()
@@ -137,12 +139,14 @@ class Engine:
 
     def _budget(self, args):
         """Seconds to think, or None for no time limit."""
+        self._left = None
         if "movetime" in args:
             return max(0.01, args["movetime"] / 1000 - MOVE_OVERHEAD)
         if args.get("infinite") or "nodes" in args:
             return None
         white = self.board.turn == chess.WHITE
         left = args.get("wtime" if white else "btime")
+        self._left = None if left is None else left / 1000
         if left is None:
             return 1.0
         inc = args.get("winc" if white else "binc", 0) / 1000
@@ -153,7 +157,6 @@ class Engine:
 
     def _search(self, args):
         e, board = self.engine, self.board
-        cfg = e.CFG
         if board.is_game_over():
             send("bestmove 0000")
             return
@@ -175,25 +178,20 @@ class Engine:
         deadline = None if budget is None else t0 + budget
         max_sims = args.get("nodes")
         tree = e._tree_for(board)
-        done, last_info, only_move = 0, t0, None
-        while not self.stop.is_set():
-            if deadline is not None and time.time() >= deadline:
-                break
-            if max_sims is not None and done >= max_sims:
-                break
-            k = cfg.play_batch if max_sims is None else min(cfg.play_batch, max_sims - done)
-            planes, n = tree.select_leaves(k)
-            done += n
-            if planes:
-                logits, values = e._evaluator(np.stack(planes))
-                tree.expand_leaves(logits, values)
-            if time.time() - last_info > 1.0:
+        last_info = [t0]
+
+        def progress(done):
+            if time.time() - last_info[0] > 1.0:
                 self._info(tree, done, t0)
-                last_info = time.time()
-            if only_move is None and done >= 1:
-                only_move = len(tree.root.moves or ()) == 1
-            if only_move:
-                break                        # only one legal move: play it
+                last_info[0] = time.time()
+
+        hard = None
+        if deadline is not None and self._left is not None:
+            # smart time use may think up to 1.5x the budget on unstable moves,
+            # never past half the remaining clock
+            hard = t0 + min(1.5 * budget, max(0.01, self._left * 0.5 - MOVE_OVERHEAD))
+        done = e.run_search(tree, sims=max_sims, deadline=deadline, stop=self.stop,
+                            on_progress=progress, hard_deadline=hard)
         self._info(tree, done, t0)
         best = tree.best_move(temperature=0.0)
         send(f"bestmove {best.uci()}")
@@ -230,7 +228,7 @@ def main():
             send(f"id name {NAME}")
             send("id author Peter")
             send("option name OwnBook type check default false")
-            send("option name Tablebase type check default false")
+            send("option name Tablebase type check default true")
             send("uciok")
         elif cmd == "isready":
             eng.loaded.wait()

@@ -23,9 +23,11 @@
 #include <cmath>
 #include <cstdint>
 #include <cstring>
+#include <deque>
 #include <limits>
 #include <random>
 #include <string>
+#include <unordered_map>
 #include <unordered_set>
 #include <vector>
 
@@ -210,10 +212,18 @@ struct Node {
     bool in_flight = false;
     double terminal = std::numeric_limits<double>::quiet_NaN();   // NaN = not terminal / unknown
     bool terminal_known = false;
+    bool draw = false;              // terminal is a draw: valued with the current contempt
+    int8_t proven = 0;              // solver: +1 won / -1 lost for the side to move, 0 unknown
+};
+
+struct CacheEntry {                 // network output for one position
+    std::vector<float> P;           // priors in canonical move order
+    float v;
 };
 
 struct Leaf {
     int32_t node;
+    uint64_t key = 0;               // eval-cache key (position + 50-move clock + ep)
     std::vector<std::pair<int32_t, int32_t>> path;   // (node, edge)
     std::vector<Mv> moves;
     bool white;
@@ -242,7 +252,8 @@ class Tree {
 
     // One descent without virtual loss (select_leaf). Returns planes or None.
     py::object select_leaf() {
-        if (!batch_.empty()) throw std::runtime_error("expand_backup() not called after select");
+        if (!batch_.empty() || !queued_.empty())
+            throw std::runtime_error("expand_backup()/expand_leaves() not called after select");
         int r = descend(false);
         if (r <= 0) return py::none();
         py::array_t<uint8_t> out({1, PLANES, 8, 8});
@@ -261,7 +272,10 @@ class Tree {
 
     // Up to k descents with virtual loss. Returns (planes (n,19,8,8) u8, sims).
     py::tuple select_leaves(int k) {
-        if (!batch_.empty()) throw std::runtime_error("expand_leaves() not called after select");
+        // Several batches may be in flight (pipelining: select the next batch
+        // while the GPU evaluates the previous one); virtual loss and the
+        // in-flight flags keep them apart. expand_leaves() answers the oldest.
+        if (!batch_.empty()) throw std::runtime_error("expand_backup() not called after select_leaf");
         int sims = 0;
         for (int i = 0; i < k; i++) {
             int r = descend(true);
@@ -272,18 +286,23 @@ class Tree {
         py::array_t<uint8_t> out({(py::ssize_t)n, (py::ssize_t)PLANES, (py::ssize_t)8, (py::ssize_t)8});
         if (n) std::memcpy(out.mutable_data(), planes_.data(), n * PLANES * 64);
         planes_.clear();
+        if (n) {
+            queued_.push_back(std::move(batch_));
+            batch_.clear();
+        }
         return py::make_tuple(out, sims);
     }
 
     void expand_leaves(py::array_t<float, py::array::c_style | py::array::forcecast> logits,
                        py::array_t<float, py::array::c_style | py::array::forcecast> values) {
-        size_t n = batch_.size();
+        if (queued_.empty()) return;             // the batch had no leaves to evaluate
+        std::vector<Leaf> batch = std::move(queued_.front());
+        queued_.pop_front();
+        size_t n = batch.size();
         if ((size_t)logits.shape(0) < n || (size_t)values.shape(0) < n)
             throw std::runtime_error("expand_leaves: too few outputs");
         const float* lg = logits.data();
         const float* vs = values.data();
-        std::vector<Leaf> batch;
-        batch.swap(batch_);
         for (size_t i = 0; i < n; i++) expand(batch[i], lg + i * POLICY_SIZE, (double)vs[i], true);
     }
 
@@ -355,7 +374,8 @@ class Tree {
 
     // Play a move (uci) at the root, keeping its subtree if present.
     void advance(const std::string& u) {
-        if (!batch_.empty()) throw std::runtime_error("advance() with leaves pending");
+        if (!batch_.empty() || !queued_.empty())
+            throw std::runtime_error("advance() with leaves pending");
         Move m = uci::uciToMove(board_, u);
         Mv mv = make_mv(m);
         int32_t new_root = -1;
@@ -378,11 +398,33 @@ class Tree {
         Node& nr = nodes_[root_];
         if (!nr.expanded) {
             nr.terminal_known = false;
+            nr.draw = false;
             nr.terminal = std::numeric_limits<double>::quiet_NaN();
         }
     }
 
     size_t node_count() const { return nodes_.size(); }
+
+    // Tuning knobs beyond mcts.py's (defaults reproduce it exactly).
+    void set_contempt(double c) { contempt_ = c; }
+    void set_solver(bool on) { solver_ = on; }
+    // per root move: +1 = proven win for us, -1 = proven loss, 0 = unknown
+    std::vector<int> root_proven() const {
+        std::vector<int> out;
+        const Node& r = nodes_[root_];
+        for (int32_t c : r.children) out.push_back(c >= 0 ? -(int)nodes_[c].proven : 0);
+        return out;
+    }
+    void set_cache(size_t cap) { cache_cap_ = cap; if (!cap) cache_.clear(); }
+    py::tuple cache_stats() const { return py::make_tuple(cache_lookups_, cache_hits_, cache_.size()); }
+    void set_root_fpu(double v) { root_fpu_ = v; }   // NaN = same as inside the tree
+    size_t pending_batches() const { return queued_.size(); }
+
+    void set_search_params(double policy_temp, double cpuct_base, double cpuct_factor) {
+        inv_policy_temp_ = (float)(1.0 / policy_temp);
+        cpuct_base_ = cpuct_base;
+        cpuct_factor_ = cpuct_factor;
+    }
 
   private:
     // ---- internals -----------------------------------------------------------
@@ -433,7 +475,7 @@ class Tree {
         root_ = 0;
     }
 
-    int puct_select(const Node& node) const {
+    int puct_select(const Node& node, bool is_root = false) const {
         const size_t k = node.moves.size();
         int64_t n_total = 0;
         double w_total = 0.0, p_visited = 0.0;
@@ -447,16 +489,26 @@ class Tree {
         double fpu_q = 0.0;
         const bool fpu = n_total && use_fpu_;
         if (fpu) fpu_q = w_total / (double)n_total - fpu_ * std::sqrt(p_visited);
+        // optional absolute FPU at the root (Lc0's FpuValueAtRoot idea): unvisited
+        // root moves score root_fpu_ (e.g. -1 = as if lost). NaN = same rule as inside.
+        const bool root_abs = is_root && !std::isnan(root_fpu_) && n_total;
+        if (root_abs) fpu_q = root_fpu_;
         const double sq = std::sqrt((double)(n_total + 1));
-        const float cp32 = (float)c_puct_;
+        // Optional Lc0-style growth of c_puct with the node's visits:
+        // c(N) = c_puct + factor * ln((N + base) / base). factor 0 = constant.
+        const float cp32 = cpuct_factor_ == 0.0
+            ? (float)c_puct_
+            : (float)(c_puct_ + cpuct_factor_ * std::log(((double)n_total + cpuct_base_) / cpuct_base_));
         int best = 0;
         double best_s = -std::numeric_limits<double>::infinity();
         for (size_t i = 0; i < k; i++) {
             int32_t n = node.N[i] + (vl ? node.VL[i] : 0);
             double w = (double)node.W[i] - (vl ? node.VL[i] : 0);
             double q;
-            if (fpu && n == 0) q = fpu_q;
+            if ((fpu || root_abs) && n == 0) q = fpu_q;
             else q = w / (double)std::max(n, 1);
+            if (solver_ && node.children[i] >= 0 && nodes_[node.children[i]].proven)
+                q = -(double)nodes_[node.children[i]].proven;   // exact: won/lost for us
             double u = (double)(cp32 * node.P[i]) * (sq / (double)(1 + n));
             double s = q + u;
             if (s > best_s) {
@@ -470,15 +522,16 @@ class Tree {
     // Returns 1 = leaf queued for evaluation, 0 = terminal (backed up), -1 = collision.
     int descend(bool virtual_loss) {
         Board& b = board_;
+        const bool root_white = b.sideToMove() == Color::WHITE;
         int32_t id = root_;
         Leaf leaf;
         std::vector<uint64_t> line{b.hash()};
         std::vector<Move> played;
         int ep = root_ep_;
 
-        while (nodes_[id].expanded) {
+        while (nodes_[id].expanded && !(solver_ && nodes_[id].proven)) {
             Node& node = nodes_[id];
-            int i = puct_select(node);
+            int i = puct_select(node, id == root_);
             leaf.path.push_back({id, i});
             if (virtual_loss) {
                 if (node.VL.empty()) node.VL.assign(node.moves.size(), 0);
@@ -506,12 +559,21 @@ class Tree {
             revert_vl(leaf.path);
             return -1;
         }
+        if (solver_ && nodes_[id].proven) {     // proven result: exact value, no expansion
+            const double pv = nodes_[id].proven;
+            unwind();
+            if (virtual_loss) revert_vl(leaf.path);
+            backup(leaf.path, pv);
+            return 0;
+        }
 
         Node& node = nodes_[id];
         double term;
         std::vector<Mv> moves;
+        bool is_draw = false;
         if (node.terminal_known) {
             term = node.terminal;
+            is_draw = node.draw;
         } else {
             uint64_t key = line.back();
             bool rep = false;
@@ -522,6 +584,7 @@ class Tree {
             }
             if (rep) {
                 term = 0.0;
+                is_draw = true;
             } else {
                 Movelist ml;
                 movegen::legalmoves(ml, b);
@@ -529,21 +592,57 @@ class Tree {
                 for (const auto& m : ml) moves.push_back(make_mv(m));
                 std::sort(moves.begin(), moves.end(), mv_less);
                 term = terminal_value(b, (int)moves.size());
+                is_draw = term == 0.0;
             }
             node.terminal = term;
+            node.draw = is_draw;
             node.terminal_known = !std::isnan(term);
         }
+        // Contempt: a draw counts as -contempt for the side to move at the root
+        // (so the engine avoids draws when it thinks it is better); 0 = plain draw.
+        if (is_draw && contempt_ != 0.0)
+            term = ((b.sideToMove() == Color::WHITE) == root_white) ? -contempt_ : contempt_;
         if (!std::isnan(term)) {
             unwind();
             if (virtual_loss) revert_vl(leaf.path);
             backup(leaf.path, term);
+            if (solver_ && term == -1.0 && !leaf.path.empty()) {   // checkmate
+                node.proven = -1;
+                propagate_proof(leaf.path);
+            }
             return 0;
+        }
+
+        // Transpositions: a position already evaluated (reached by another
+        // move order) is expanded from the cache without a network call. The
+        // key covers everything the network sees (pieces, side, castling,
+        // 50-move clock, en passant), so the result is what the net would give.
+        const uint64_t key = line.back() ^ ((uint64_t)b.halfMoveClock() * 0x9E3779B97F4A7C15ULL)
+                             ^ ((uint64_t)(ep + 1) * 0xC2B2AE3D27D4EB4FULL);
+        if (cache_cap_) {
+            cache_lookups_++;
+            auto it = cache_.find(key);
+            if (it != cache_.end()) {
+                cache_hits_++;
+                unwind();
+                if (virtual_loss) revert_vl(leaf.path);
+                const size_t k = moves.size();
+                node.moves = std::move(moves);
+                node.P = it->second.P;
+                node.N.assign(k, 0);
+                node.W.assign(k, 0.0f);
+                node.children.assign(k, -1);
+                node.expanded = true;
+                backup(leaf.path, (double)it->second.v);
+                return 0;
+            }
         }
 
         size_t off = planes_.size();
         planes_.resize(off + PLANES * 64);
         encode(b, ep, planes_.data() + off);
         leaf.node = id;
+        leaf.key = key;
         leaf.moves = std::move(moves);
         leaf.white = b.sideToMove() == Color::WHITE;
         unwind();
@@ -562,7 +661,7 @@ class Tree {
         std::vector<float> pr(k);
         float mx = -std::numeric_limits<float>::infinity();
         for (size_t i = 0; i < k; i++) {
-            pr[i] = logits[move_to_index(leaf.moves[i], leaf.white)];
+            pr[i] = logits[move_to_index(leaf.moves[i], leaf.white)] * inv_policy_temp_;
             mx = std::max(mx, pr[i]);
         }
         float sum = 0.0f;
@@ -571,6 +670,10 @@ class Tree {
             sum += pr[i];
         }
         for (size_t i = 0; i < k; i++) pr[i] /= sum;
+        if (cache_cap_) {
+            if (cache_.size() >= cache_cap_) cache_.clear();
+            cache_[leaf.key] = CacheEntry{pr, (float)value};
+        }
         node.moves = std::move(leaf.moves);
         node.P = std::move(pr);
         node.N.assign(k, 0);
@@ -578,6 +681,26 @@ class Tree {
         node.children.assign(k, -1);
         node.expanded = true;
         backup(leaf.path, value);
+    }
+
+    // MCTS-solver: a node whose child is lost (for the child's mover) is won;
+    // a node all of whose moves lead to won children (for the opponent) is
+    // lost. Walk up the path while proofs keep appearing.
+    void propagate_proof(const std::vector<std::pair<int32_t, int32_t>>& path) {
+        for (auto it = path.rbegin(); it != path.rend(); ++it) {
+            Node& parent = nodes_[it->first];
+            if (parent.proven) return;
+            const Node& child = nodes_[parent.children[it->second]];
+            if (child.proven == -1) {
+                parent.proven = 1;
+            } else if (child.proven == 1) {
+                for (int32_t c : parent.children)
+                    if (c < 0 || nodes_[c].proven != 1) return;
+                parent.proven = -1;
+            } else {
+                return;
+            }
+        }
     }
 
     void revert_vl(const std::vector<std::pair<int32_t, int32_t>>& path) {
@@ -599,9 +722,18 @@ class Tree {
     std::unordered_set<uint64_t> history_;
     std::vector<Node> nodes_;
     int32_t root_ = 0;
-    std::vector<Leaf> batch_;
+    std::vector<Leaf> batch_;                  // leaves of the batch being selected
+    std::deque<std::vector<Leaf>> queued_;     // selected batches awaiting expand_leaves()
+    double contempt_ = 0.0;
+    bool solver_ = false;
+    std::unordered_map<uint64_t, CacheEntry> cache_;
+    size_t cache_cap_ = 0;                      // 0 = no eval cache
+    int64_t cache_lookups_ = 0, cache_hits_ = 0;
+    double root_fpu_ = std::numeric_limits<double>::quiet_NaN();
     std::vector<uint8_t> planes_;
     double c_puct_;
+    double cpuct_base_ = 38739.0, cpuct_factor_ = 0.0;
+    float inv_policy_temp_ = 1.0f;          // softmax(logits / T); T = 1 multiplies by exactly 1
     bool use_fpu_;
     double fpu_;
     bool repetition_draws_;
@@ -656,7 +788,16 @@ PYBIND11_MODULE(fastmcts, m) {
         .def("pv", &Tree::pv, py::arg("max_len") = 64)
         .def("depth_stats", &Tree::depth_stats)
         .def("advance", &Tree::advance)
-        .def("node_count", &Tree::node_count);
+        .def("node_count", &Tree::node_count)
+        .def("set_contempt", &Tree::set_contempt)
+        .def("set_solver", &Tree::set_solver)
+        .def("root_proven", &Tree::root_proven)
+        .def("set_cache", &Tree::set_cache)
+        .def("cache_stats", &Tree::cache_stats)
+        .def("set_root_fpu", &Tree::set_root_fpu)
+        .def("pending_batches", &Tree::pending_batches)
+        .def("set_search_params", &Tree::set_search_params, py::arg("policy_temp") = 1.0,
+             py::arg("cpuct_base") = 38739.0, py::arg("cpuct_factor") = 0.0);
     m.def("encode_fen", &encode_fen);
     m.def("legal_moves_fen", &legal_moves_fen);
 }
