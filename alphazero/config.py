@@ -26,9 +26,9 @@ class Config:
     cpuct_factor: float = 0.0           #   (0 = constant c_puct, the original rule)
     contempt: float = 0.0               # native only: draws = -contempt for us when root Q > threshold
     contempt_threshold: float = 0.1
-    q_select: float = 0.0               # native: final move = best Q among moves with >= this share of max visits (0 = most visits)
-    eval_cache: int = 0                 # native: cached network outputs for transpositions (entries; 0 = off)
-    solver: bool = False                # native: MCTS-solver (proven mates propagate up the tree)
+    q_select: float = 0.5               # native: final move = best Q among moves with >= this share of max visits (0 = most visits); +69 @800, +19 @3200
+    eval_cache: int = 500_000           # native: cached network outputs for transpositions (entries; 0 = off); 21-38% of leaves hit
+    solver: bool = True                 # native: MCTS-solver (proven mates propagate up the tree); tested neutral, proves mates
     smart_time: bool = False            # UCI: stop early if the best move can't be caught; extend (<=1.5x) if unstable
     dirichlet_alpha: float = 0.3
     dirichlet_eps: float = 0.25
