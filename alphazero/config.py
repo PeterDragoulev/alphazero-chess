@@ -60,7 +60,7 @@ class Config:
     # --- paths ---
     data_dir: str = "data"
     checkpoint: str = "data/checkpoint.pt"
-    pretrained_weights: str = "weights/lichess_otb_7.12M_128x10.pt"   # shipped net (older: lichess_5.66M, pretrained_128x10)
+    pretrained_weights: str = "weights/lichess_se_8.71M_128x10.pt"   # shipped net (older: lichess_otb_7.12M, lichess_5.66M, pretrained_128x10)
     buffer_dir: str = "data/buffer"
     book_path: str = "books/komodo.bin"  # polyglot; optional (engine skips if absent)
 

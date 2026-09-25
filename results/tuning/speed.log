@@ -1,0 +1,8 @@
+normal batch  4:   3,525 sims/s
+normal batch  8:   5,873 sims/s
+normal batch 16:   8,620 sims/s
+normal batch 32:  15,414 sims/s
+frozen batch  4:   3,955 sims/s
+frozen batch  8:   6,559 sims/s
+frozen batch 16:   9,928 sims/s
+frozen batch 32:  16,520 sims/s

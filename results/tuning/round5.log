@@ -1,0 +1,16 @@
+=== cache on vs off (800 nodes; identical outputs expected ~0)
+B: 800 nodes/move on average
+
+B vs A: +34 =71 -23  score 0.543  ->  +30 Elo (95% CI -2 .. +62)  [805s]
+=== solver on (800 nodes)
+B: 800 nodes/move on average
+
+B vs A: +32 =65 -31  score 0.504  ->  +3 Elo (95% CI -19 .. +25)  [869s]
+=== smart time use, clock = 40 moves x 800 nodes
+B: 719 nodes/move on average
+
+B vs A: +33 =59 -36  score 0.488  ->  -8 Elo (95% CI -36 .. +20)  [851s]
+=== cpuct growth factor 1.0 base 3000 (3200 nodes)
+B: 3,200 nodes/move on average
+
+B vs A: +22 =74 -32  score 0.461  ->  -27 Elo (95% CI -63 .. +8)  [3892s]

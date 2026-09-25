@@ -1,0 +1,2 @@
+=== A: default (batch 16, pt 1.3)  B: play_batch=8, 800 nodes
+B vs A: +46 =58 -24  score 0.586  ->  +60 Elo (95% CI +17 .. +106)  [979s]

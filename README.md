@@ -4,11 +4,11 @@ A chess engine built up in stages, from classical game-tree search to an
 AlphaZero-style policy-value network guided by Monte-Carlo Tree Search, and
 trained entirely on one laptop GPU (RTX 3070 Ti, 8 GB VRAM).
 
-> **Strength: roughly 2,950 on the CCRL 40/15 computer rating list**
-> (rough estimate from short matches against Stash 23.0 and 27.0, engines with
-> published CCRL ratings of 2902 and 3022), and about 2,850–2,900 against
-> strength-limited Stockfish. These are computer-rating scales, not FIDE or
-> chess.com ratings; see [Results](#results).
+> **Strength: roughly 3,000–3,100 on the CCRL 40/15 computer rating list.**
+> The current engine beat Stash 27.0 (CCRL 3022) 4.5–2.5 in a 7-game match at
+> 40 moves / 2 min, after scoring around 50% against it with earlier nets.
+> Short matches, so wide error bars; see [Results](#results). These are
+> computer-rating scales, not FIDE or chess.com ratings.
 
 | Stage | Folder | Idea |
 |---|---|---|
@@ -20,10 +20,15 @@ trained entirely on one laptop GPU (RTX 3070 Ti, 8 GB VRAM).
 
 **Headline numbers** (all measured on this repo; see [Results](#results)):
 
-- **~2,950 CCRL 40/15** (rough, from 5-game matches at 40 moves / 2 min: 3–2 vs
-  Stash 23.0 at 2902, 2–3 vs Stash 27.0 at 3022; after the master-games
-  fine-tune, 3–2 vs Stash 27.0) and **~2,850–2,900 vs strength-limited
-  Stockfish** (UCI_Elo scale, 40 games at four levels).
+- **~3,000–3,100 CCRL 40/15** (rough): **4.5–2.5 vs Stash 27.0 (3022)** with the
+  current net and search; earlier nets went 3–2 vs Stash 23.0 (2902) and
+  2–3 / 3–2 / 3.5–3.5 vs Stash 27.0. **~2,850–2,900 vs strength-limited
+  Stockfish** with an earlier net (UCI_Elo scale, 40 games at four levels).
+- Search settings are tuned with a fixed-node A/B tuner (`tune_match.py`,
+  128-game paired matches in ~15 min): policy temperature **+38 Elo**,
+  virtual-loss batch 32 **+115 Elo** at equal time, Q-based final move choice
+  **+69** (800 nodes), plus a transposition cache that skips **21–38%** of
+  network calls. Several popular ideas measured neutral or worse (below).
 - Alpha-beta finds the same move scores as minimax while searching **7–52x fewer nodes**.
 - Self-play MCTS runs **~16–18x faster** than the naive implementation:
   ~14–17x from batching leaf evaluations across 64 games into single GPU calls,
@@ -139,8 +144,16 @@ config.py       every hyperparameter in one place
 
 ### Network (`network.py`)
 
-A ResNet with a 128-channel stem and 10 residual blocks (**3.66M
-parameters**), sized to fit the 8 GB VRAM budget. It has two heads:
+A ResNet with a 128-channel stem and 10 residual blocks with
+**squeeze-and-excitation** (**3.79M parameters**), sized to fit the 8 GB VRAM
+budget. Each SE module averages every channel over the board, runs the
+128 channel means through a small MLP and rescales/shifts every channel from
+that global summary (king safety, game phase), which 3×3 convolutions only
+see slowly. The SE modules were added to an already-trained net by surgery
+(`add_se.py`): their last layer starts at zero, so each gate is exactly 1 and
+the converted net is bit-identical to the original until training teaches it
+to use them. After a night of further training the SE net beat the pre-SE
+net by **+46 Elo** (+7..+87, 800 nodes, 128 games). It has two heads:
 
 - **Policy:** 3×3 conv → 1×1 conv to 73 planes → 4,672 logits
 - **Value:** 1×1 conv → FC 256 → `tanh` scalar
@@ -148,7 +161,10 @@ parameters**), sized to fit the 8 GB VRAM budget. It has two heads:
 The loss is `cross_entropy(policy, π) + MSE(value, z)`, trained with AdamW
 under fp16 autocast and a GradScaler, with gradient clipping at 1.0.
 Inference goes through `Evaluator`, which takes uint8 planes in and returns
-numpy arrays out, running in fp16.
+numpy arrays out, running in fp16. For play, `Evaluator(frozen=True)` uses a
+private copy with BatchNorm folded into the convolutions, fp16 weights cast
+once and `channels_last` layout (tensor-core kernels): a batch-32 call drops
+from ~1.44 to ~0.99 ms, with the same top move on 128/128 test positions.
 
 ### MCTS (`mcts.py`)
 
@@ -293,7 +309,9 @@ phases just means running the other script.
 
 The play path is: opening book → Lichess 7-piece endgame tablebase (probed
 online, only when ≤ 7 pieces remain) → MCTS with 6,400 simulations per move
-(~5 s, batched 16 leaves per GPU call, tree reused between moves). The search
+(batched 32 leaves per GPU call, ~19,700 simulations/s, tree reused between
+moves, repeated positions answered from a transposition cache, forced mates
+proven by an MCTS-solver, final move = best Q among well-visited moves). The search
 budget is doubled or quadrupled in endgames, where the tree is narrow and deep
 calculation decides the game.
 
@@ -388,6 +406,32 @@ seldepth = deepest line searched):
 In a short check (10 paired-opening games, a small sample), the new settings
 at 1,600 simulations scored +7 =3 −0 against the old ones at 400.
 
+**Tuning the search.** Once the tree was fast, the open question was the
+settings, and 5-game matches can't see a 30-Elo change. `alphazero/tune_match.py`
+plays two configurations (or two nets) against each other at fixed
+simulations per move: every game in lockstep, all leaves in one GPU batch per
+round, each 8-move opening played with both colours, Elo with a 95% CI from
+the opening pairs. Fixed nodes make it immune to GPU sharing, and
+`--a-nodes/--b-nodes` scaled by measured speed give equal-time tests.
+
+| Change (128 games each) | Result (Elo, 95% CI) | Kept |
+|---|---|---|
+| Policy softmax temperature 1.3 (vs 1.0) | +69 (+27..+112) @800, **+38 (+2..+75) @3,200** | yes |
+| Virtual-loss batch 32 vs 16, **equal time** (1.66x faster) | **+115 (+79..+154)** | yes |
+| Batch 8 vs 16, equal time | −103 (−142..−68) | |
+| Batch 64 vs 32, equal time | −19 (−56..+17) | |
+| Q-based final move (best Q among moves with ≥50% of top visits) | **+69 (+23..+117)** @800, +19 (−13..+52) @3,200 | yes |
+| Transposition eval cache (equal nodes; the gain is speed) | +30 (−2..+62); 21–38% of leaves hit | yes |
+| MCTS-solver (proven mates) | +3 (−19..+25) | yes (proves mates) |
+| c_puct 2.0 / 1.2 | −52 / ±0 | |
+| FPU 0.4; root FPU −1 / 0 | −11; −14 / −3 | |
+| c_puct growing with visits (Lc0-style) | −27 (−63..+8) @3,200 | |
+| Draw contempt 0.1 | −11 (−31..+9) | |
+| Smart time use (node-clock emulation) | −8 (−36..+20) | |
+| Two batches in flight (CPU/GPU pipelining) | 0.94–0.97x speed: a step is ~1.66 ms GPU vs ~0.28 ms CPU | |
+
+Logs: [`results/tuning/`](results/tuning).
+
 ---
 
 ## Results
@@ -470,9 +514,13 @@ from the 8-move opening suite used in Stockfish testing:
 | 6.5M-game Lichess 2400+ | Stash 23.0 (2902) | +3 =0 −2 | ~2970 |
 | same | Stash 27.0 (3022) | +1 =2 −2 | ~2950 |
 | + master-games fine-tune | Stash 27.0 (3022) | +2 =2 −1 | ~3090 |
+| + Stockfish-eval value targets, native tree (7 games) | Stash 27.0 (3022) | +2 =3 −2 | ~3020 |
+| **+ SE blocks, tuned search** (8.71M-game net, 7 games) | Stash 27.0 (3022) | **+4 =1 −2** | **~3120** |
 
-Together: **roughly 2,950 CCRL 40/15**, with wide error bars (5 games per
-match). Logs and PGNs: [`results/ccrl/`](results/ccrl).
+Together: **roughly 3,000–3,100 CCRL 40/15**, with wide error bars (5–7 games
+per match). The last match's net is the shipped default
+(`alphazero/weights/lichess_se_8.71M_128x10.pt`). Logs and PGNs:
+[`results/ccrl/`](results/ccrl).
 
 ---
 
@@ -493,6 +541,11 @@ CHESS_MODEL=data/other.pt python ui.py   # play a specific checkpoint
 # Benchmarks (from the repo root)
 python benchmarks/check_equivalence.py
 python benchmarks/bench_mcts.py
+python benchmarks/speed_bench.py      # play-search sims/s by batch size
+
+# A/B test search settings or nets (inside alphazero/, needs rating/setup.sh's book)
+python tune_match.py --b policy_temp=1.0 --games 128 --nodes 800
+python tune_match.py --a-model weights/lichess_otb_7.12M_128x10.pt --b-model weights/lichess_se_8.71M_128x10.pt
 
 # Faster search: build the native tree (optional, ~15 s; needs g++)
 alphazero/native/build.sh && python alphazero/native/check_native.py
@@ -523,10 +576,9 @@ Set `HF_TOKEN` for higher HuggingFace rate limits on long pretraining runs.
 
 ## Limitations and next steps
 
-- With the native tree, search is bound by GPU calls. Larger virtual-loss
-  batches (more simulations/s, slightly less effective per simulation) and
-  overlapping CPU and GPU work are the next levers; the best batch size needs
-  a strength test, not just a speed test.
+- Search is bound by GPU calls: at batch 32 a step is ~1.66 ms of GPU work vs
+  ~0.28 ms of CPU, so a larger or more efficient network is now the main
+  trade-off (a bigger net costs simulations; it has to win at equal time).
 - The rating numbers come from 5–10 game matches; they are rough (±200–300).
 - `evaluate.py` still evaluates one leaf at a time. Batching arena games the
   way `selfplay.py` does would speed up evaluation a lot.

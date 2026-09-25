@@ -1,0 +1,2 @@
+=== equal time: A batch32 @3200  B batch64 @3808 (speed ratio 1.19), SE net 9.44M
+B vs A: +24 =73 -31  score 0.473  ->  -19 Elo (95% CI -56 .. +17)  [2751s]

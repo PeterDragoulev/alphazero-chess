@@ -1,0 +1,4 @@
+=== equal time: A batch16 @3200  B batch8 @2112 (speed ratio 0.66), final SE net
+B vs A: +7 =77 -44  score 0.355  ->  -103 Elo (95% CI -142 .. -68)  [2186s]
+=== equal time: A batch16 @3200  B batch32 @5320 (speed ratio 1.66)
+B vs A: +47 =75 -6  score 0.660  ->  +115 Elo (95% CI +79 .. +154)  [3062s]

@@ -1,0 +1,24 @@
+Indexing opening suite...
+Started game 1 of 7 (AlphaZeroChess_SE vs Stash27)
+Started game 2 of 7 (Stash27 vs AlphaZeroChess_SE)
+Finished game 2 (Stash27 vs AlphaZeroChess_SE): 1-0 {White mates}
+Started game 3 of 7 (AlphaZeroChess_SE vs Stash27)
+Finished game 1 (AlphaZeroChess_SE vs Stash27): 1-0 {White mates}
+Started game 4 of 7 (Stash27 vs AlphaZeroChess_SE)
+Finished game 3 (AlphaZeroChess_SE vs Stash27): 0-1 {Black mates}
+Started game 5 of 7 (AlphaZeroChess_SE vs Stash27)
+Finished game 4 (Stash27 vs AlphaZeroChess_SE): 0-1 {Black mates}
+Started game 6 of 7 (Stash27 vs AlphaZeroChess_SE)
+Finished game 5 (AlphaZeroChess_SE vs Stash27): 1/2-1/2 {Draw by 3-fold repetition}
+Started game 7 of 7 (AlphaZeroChess_SE vs Stash27)
+Finished game 6 (Stash27 vs AlphaZeroChess_SE): 0-1 {Black mates}
+Finished game 7 (AlphaZeroChess_SE vs Stash27): 1-0 {White mates}
+--------------------------------------------------
+Results of AlphaZeroChess_SE vs Stash27 (40/120, NULL - 1t, NULL - 16MB, 8moves_v3.pgn):
+Elo: 102.11 +/- 365.92, nElo: 112.72 +/- 257.38
+LOS: 80.47 %, DrawRatio: 14.29 %
+Games: 7, Wins: 4, Losses: 2, Draws: 1, Points: 4.5 (64.29 %)
+--------------------------------------------------
+Finished match
+Total Time: 00:22:50 (hours:minutes:seconds)
+

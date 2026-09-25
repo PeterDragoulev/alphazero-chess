@@ -1,0 +1,6 @@
+=== B: root_fpu=-1 (800 nodes, 9.44M SE net)
+B vs A: +36 =51 -41  score 0.480  ->  -14 Elo (95% CI -42 .. +15)  [1016s]
+=== B: root_fpu=0 (800 nodes, 9.44M SE net)
+B vs A: +47 =33 -48  score 0.496  ->  -3 Elo (95% CI -35 .. +30)  [932s]
+=== B: qsel=0.5 (800 nodes, 9.44M SE net)
+B vs A: +50 =53 -25  score 0.598  ->  +69 Elo (95% CI +23 .. +117)  [929s]
